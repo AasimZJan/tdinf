@@ -15,6 +15,8 @@ from .preprocessing import get_ACF
 from .whiten import whitenData
 import astropy.units as u
 
+from .waveform_backends import is_external_approximant, make_backend
+
 def check_spin_settings_of_approx(approx_name):
     """
     Check the spin configuration supported by a given waveform approximant.
@@ -29,12 +31,15 @@ def check_spin_settings_of_approx(approx_name):
     
     aligned_spins = False
     no_spins = False
-
+    # for external approximants
+    if is_external_approximant(approx_name):
+        return False, False  
+    
     approx = lalsim.GetApproximantFromString(approx_name)
 
     if not lalsim.SimInspiralImplementedTDApproximants(approx):
         raise ValueError(f"ERROR: {approx_name} is not available as a time domain waveform")
-
+    
     spin_enum = lalsim.SimInspiralGetSpinSupportFromApproximant(approx)
 
     if spin_enum == lalsim.SIM_INSPIRAL_PRECESSINGSPIN:
@@ -475,7 +480,12 @@ class WaveformManager(LogisticParameterManager):
     def __init__(self, ifos, *args, **kwargs):
         super(WaveformManager, self).__init__(*args, **kwargs)
         self.approx_name = kwargs['approx']
-        self.approximant = lalsim.SimInspiralGetApproximantFromString(self.approx_name)
+        if is_external_approximant(self.approx_name):
+            self.approximant = None
+            self.backend = make_backend(self.approx_name)
+        else:
+            self.approximant = lalsim.SimInspiralGetApproximantFromString(self.approx_name)
+            self.backend = None
         self.antenna_and_time_manager = AntennaAndTimeManager(ifos, *args, **kwargs)
 
     def generate_lal_hphc(self, m1_msun, m2_msun, chi1, chi2, delta_t, dist_mpc=1,
@@ -558,6 +568,19 @@ class WaveformManager(LogisticParameterManager):
         chi1 = [x_phys['spin1_x'], x_phys['spin1_y'], x_phys['spin1_z']]
         chi2 = [x_phys['spin2_x'], x_phys['spin2_y'], x_phys['spin2_z']]
 
+        if self.backend is not None:
+            hp, hc = self.backend.get_hphc(
+                m1, m2, chi1, chi2, delta_t=delta_t,
+                dist_mpc=x_phys['luminosity_distance'],
+                f22_start=f22_start, f_ref=f_ref,
+                inclination=x_phys['inclination'], phi_ref=x_phys['phase']
+            )
+            # for catching waveform errors
+            if isinstance(hp, float) and hp!=hp:
+                return np.nan, np.nan
+            # already a Timeseries
+            return hp, hc
+        
         hp, hc = self.generate_lal_hphc(m1, m2, chi1, chi2, delta_t=delta_t,
                                         dist_mpc=x_phys['luminosity_distance'],
                                         f22_start=f22_start, f_ref=f_ref,
