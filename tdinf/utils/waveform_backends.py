@@ -6,7 +6,28 @@ from gwpy.timeseries import TimeSeries
 
 @functools.lru_cache(maxsize=None)
 def _load_module(module_name):
-    """Import once per process; later calls are a dict lookup."""
+    """
+    Import a module by name, caching the result for the life of the process.
+
+    The first call performs the real import; later calls return the cached
+    module. The module is deliberately NOT stored on backend objects, since
+    module objects cannot be pickled.
+
+    Parameters
+    ----------
+    module_name : str
+        Name of the module to import (e.g. 'EOBRun_module').
+
+    Returns
+    -------
+    module
+        The imported module.
+
+    Raises
+    ------
+    ImportError
+        If the module is not installed in the current environment.
+    """
     return importlib.import_module(module_name)
 
 
@@ -15,12 +36,39 @@ EXTERNAL_APPROXIMANTS = {'TEOBResumS'}
 
 
 def is_external_approximant(approx_name):
+    """
+    Check whether an approximant must be handled by an external backend.
+
+    Parameters
+    ----------
+    approx_name : str
+        Approximant name, as passed to `--approx`.
+
+    Returns
+    -------
+    bool
+        True if the approximant is handled by a backend in this module,
+        False if it should go through the normal LAL path.
+    """
     return approx_name in EXTERNAL_APPROXIMANTS
 
 
 class TEOBResumSBackend:
-    """TEOBResumS time-domain backend."""
+    """
+    Time-domain TEOBResumS backend, with precessing spins.
 
+    Wraps `EOBRun_module.EOBRunPy` and returns waveforms in the same form as
+    the LAL path of `WaveformManager`, so the rest of TDinf is unaware of the
+    difference. The object stores only the module name, so it is safe to
+    pickle.
+
+    Parameters
+    ----------
+    warmup : bool, optional
+        If True, make one throwaway waveform call at construction so that
+        one-time initialization happens in the parent process, before emcee
+        forks its workers. Default is True.
+    """
     def __init__(self, warmup=True):
         # Only picklable state lives on self.
         self.module_name = 'EOBRun_module'  # VERIFY: name of your install's python module
@@ -42,13 +90,38 @@ class TEOBResumSBackend:
     def get_hphc(self, m1_msun, m2_msun, chi1, chi2, delta_t, dist_mpc=1.,
                  f22_start=20., f_ref=None, inclination=0., phi_ref=0., **unused):
         """
-        Return (hp, hc) as gwpy TimeSeries with t = 0 at the amplitude peak,
-        or (np.nan, np.nan) on failure.
+        Generate plus and cross polarizations at geocenter with TEOBResumS.
 
-        `chi1`, `chi2` are [x, y, z] lists as in the LAL path; only z is used.
-        `f_ref` is ignored (aligned spins); it is accepted so the call
-        signature matches the LAL path.
+        Parameters
+        ----------
+        m1_msun, m2_msun : float
+            Component masses in solar masses, with m1_msun >= m2_msun
+        chi1, chi2 : array_like
+            Dimensionless spin vectors [x, y, z] of each component. All three
+            components are passed to the model.
+        delta_t : float
+            Time spacing of the output in seconds (sets `srate_interp`).
+        dist_mpc : float, optional
+            Luminosity distance in Mpc. Default is 1.
+        f22_start : float, optional
+            Starting frequency of the (2,2) mode in Hz. Default is 20.
+        f_ref : float, optional
+            Accepted so the signature matches the LAL path, but NOT passed to
+            TEOBResumS. Spins are interpreted in TEOBResumS's own frame, which
+            may differ from the LAL frame when f_ref != f22_start.
+        inclination : float, optional
+            Inclination angle in radians. Default is 0.
+        phi_ref : float, optional
+            Reference phase in radians, in the LAL convention. Passed to the
+            model as `coalescence_angle = pi/2 - phi_ref`.
+        **unused
+            Ignored. Lets callers pass LAL-path-only keywords (e.g. `NR_kws`).
+
+        Returns
+        -------
+        hp, hc : gwpy.timeseries.TimeSeries
         """
+
         EOB = _load_module(self.module_name)
         pars = {
                 'M'                  : m1_msun + m2_msun,
@@ -95,8 +168,6 @@ class TEOBResumSBackend:
         t_peak = t[np.argmax(hp ** 2 + hc ** 2)]
         t0 = t[0] - t_peak
 
-        # VERIFY sign convention of hc vs LAL by comparing to an aligned-spin
-        # LAL approximant (e.g. SEOBNRv4) at the same parameters.
         return TimeSeries(hp, t0=t0, dt=delta_t), TimeSeries(hc, t0=t0, dt=delta_t)
 
 
@@ -106,5 +177,25 @@ _BACKENDS = {
 
 
 def make_backend(approx_name, **kwargs):
+    """
+    Construct the backend object for an external approximant.
+
+    Parameters
+    ----------
+    approx_name : str
+        Name of an approximant for which `is_external_approximant` is True.
+    **kwargs
+        Passed to the backend constructor (e.g. `warmup=False`).
+
+    Returns
+    -------
+    TEOBResumSBackend
+        The backend for `approx_name`.
+
+    Raises
+    ------
+    KeyError
+        If `approx_name` has no registered backend.
+    """
     return _BACKENDS[approx_name](**kwargs)
 
