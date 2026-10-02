@@ -11,6 +11,58 @@ from contextlib import closing
 import os
 import tdinf.utils as utils
 
+
+"""
+Helpers for emcee multiprocessing.
+
+The likelihood manager holds all of the data, ACFs, PSDs, etc., so pickling it
+and sending it along with every emcee task is wasteful. Instead it is handed to
+each worker ONCE through the Pool initializer, and stored in a module global.
+These must live at module level (not inside main) so they can be pickled by name.
+"""
+
+_LM = None        # likelihood manager, set once in each worker process
+_VERBOSE = False  # verbose flag forwarded to get_log_posterior
+
+
+def _init_worker(likelihood_manager, verbose=False):
+    """
+    Pool initializer: runs once in each worker process.
+
+    Stores the likelihood manager in a module global so it is not re-pickled
+    with every task (under fork it is inherited; under spawn it is pickled once
+    per worker). Also limits BLAS/OpenMP thread pools to one thread, which, unlike
+    setting OMP_NUM_THREADS after numpy is imported, takes effect at runtime.
+    """
+    global _LM, _VERBOSE
+    _LM = likelihood_manager
+    _VERBOSE = verbose
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(limits=1)
+    except ImportError:
+        pass
+
+
+def _log_prob(x):
+    """Log posterior for one walker position; this is what emcee maps over walkers."""
+    return _LM.get_log_posterior(x, verbose=_VERBOSE)
+
+
+class _ChunkOnePool:
+    """
+    Wrap a multiprocessing Pool so emcee's `pool.map(f, walkers)` hands out one
+    walker at a time. A free worker immediately takes the next walker, which
+    balances the load when waveform runtimes differ between walkers (the default
+    Pool.map gives each worker a chunk of several walkers at once).
+    """
+    def __init__(self, pool):
+        self.pool = pool
+
+    def map(self, func, iterable):
+        return self.pool.map(func, iterable, chunksize=1)
+
+
 def create_run_sampler_arg_parser():
     """
     Parse arguments
@@ -592,9 +644,18 @@ def main():
         backend.reset(nwalkers, ndim)
         p0 = get_initial_walkers(likelihood_manager, args, nwalkers, ndim, reference_parameters, ref_pe_samples)
 
-    # Deactivate numpy default number of cores to avoid using too many
+    # Avoid oversubscribing cores with BLAS/OpenMP threads. Setting the environment
+    # variable here is only a fallback, since numpy is already imported and most
+    # libraries read it at load time. The real limit is applied inside each worker
+    # by threadpoolctl (see _init_worker).
     if args.ncpu > 1:
         os.environ["OMP_NUM_THREADS"] = "1"
+        try:
+            import threadpoolctl  # noqa: F401
+        except ImportError:
+            print("WARNING: threadpoolctl is not installed, so worker threads are not "
+                  "limited at runtime. Install it, or set OMP_NUM_THREADS=1 in the "
+                  "environment before launching python.")
 
     # for multiprocessing
     def sort_on_runtime(pos):
@@ -609,13 +670,15 @@ def main():
     print("Available cores: %i" % cpu_count())
     print("Running with %i cores" % args.ncpu)
     
-    with closing(Pool(processes=args.ncpu)) as pool:
+    # The likelihood manager is passed to the workers once, via the initializer
+    with closing(Pool(processes=args.ncpu,
+                      initializer=_init_worker,
+                      initargs=(likelihood_manager, verbose))) as pool:
 
-        # Set up sampler
-        sampler = emcee.EnsembleSampler(nwalkers, ndim, likelihood_manager.get_log_posterior,
-                                        backend=backend, pool=pool,
-                                        runtime_sortingfn=sort_on_runtime,
-                                        kwargs=kwargs)
+        # Set up sampler (chunksize=1 so free workers pick up the next walker)
+        sampler = emcee.EnsembleSampler(nwalkers, ndim, _log_prob,
+                                        backend=backend, pool=_ChunkOnePool(pool),
+                                        runtime_sortingfn=sort_on_runtime)
 
         # If there are still iterations left to run ... 
         if nsteps > 0:
