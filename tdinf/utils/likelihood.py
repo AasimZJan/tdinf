@@ -481,8 +481,10 @@ class WaveformManager(LogisticParameterManager):
         super(WaveformManager, self).__init__(*args, **kwargs)
         self.approx_name = kwargs['approx']
         if is_external_approximant(self.approx_name):
-            self.approximant = None
+            self.approximant = kwargs['approx']
             self.backend = make_backend(self.approx_name)
+            print(f"Approximant '{self.approx_name}' is not a LAL approximant; "
+                    f"initializing external backend ({type(self.backend).__name__}).")
         else:
             self.approximant = lalsim.SimInspiralGetApproximantFromString(self.approx_name)
             self.backend = None
