@@ -189,6 +189,11 @@ def create_run_sampler_arg_parser():
                   help = 'Include flag if you want code to print out additional information as it '
                          'runs. Helpful for debugging.')
 
+    # Diagnostics
+    p.add_argument('--produce-diagnostics', action='store_true', 
+                   help = 'Include flag if you want the code produce diagnostics. Helpful in understanding '
+                        'the health of the run and identifies issues, if any.')
+
     return p
 
 
@@ -727,6 +732,14 @@ def main():
     sample_path = backend_path.replace('h5', 'dat')
     df.to_csv(sample_path, sep=' ', index=False)
     print("File saved: %r" % sample_path)
+
+    if args.produce_diagnostics:
+        try:
+            from tdinf.utils import sampler_diagnostics
+            sampler_diagnostics.report_from_args(args, kwargs=kwargs, max_steps=20000)
+        except Exception as e:
+            print(f"WARNING: diagnostics skipped: {e}")
+        
 
 if __name__ == "__main__":
     main()
