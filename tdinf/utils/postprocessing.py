@@ -95,7 +95,7 @@ def postprocessing_get_complete_samples_dict(samples, samples_lnp, likelihood_ma
     samples_dict['ln_posterior'] = samples_lnp
     
     # Add prior values to the sample_dict
-    samples_lnprior = np.asarray([likelihood_manager.log_prior.get_lnprior(x) for x in samples])
+    samples_lnprior = np.asarray([likelihood_manager.log_prior.get_lnprior(x, use_lvk_mass_and_time_prior=likelihood_manager.use_lvk_mass_and_time_prior) for x in samples])
     samples_dict['ln_prior'] = samples_lnprior
     
     # Add likelihood values 
