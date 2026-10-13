@@ -230,7 +230,7 @@ class LogisticParameterManager:
 
 class LnPriorManager(LogisticParameterManager):
 
-    def initialize_walkers(self, nwalkers, injected_parameters, reference_posterior=None, verbose=False):
+    def initialize_walkers(self, nwalkers, injected_parameters, reference_posterior=None, verbose=False, use_lvk_mass_and_time_prior=False):
         '''
         Function to get initial walkers for an emcee run depending on 
         settings provided by the user.
@@ -288,7 +288,12 @@ class LnPriorManager(LogisticParameterManager):
 
             # if time of coalescence sampled over need to include this separately since it isn't a unit scaled quantity
             if self.vary_time:
-                initial_t_walkers = np.random.normal(loc=self.reference_time, scale=self.sigma_time, size=nwalkers)
+                if use_lvk_mass_and_time_prior:
+                    initial_t_walkers = np.random.uniform(self.reference_time-0.075, self.reference_time+0.075, size=nwalkers)
+                else:
+                    initial_t_walkers = np.random.normal(loc=self.reference_time, scale=self.sigma_time, size=nwalkers)
+                
+
                 p0_arr[:, self.sampled_keys.index('geocenter_time')] = initial_t_walkers
             
         else: 
@@ -329,7 +334,7 @@ class LnPriorManager(LogisticParameterManager):
         p0 = p0_arr.tolist()
         return p0
 
-    def get_lnprior(self, x, phys_dict=None):
+    def get_lnprior(self, x, phys_dict=None, use_lvk_mass_and_time_prior=False):
         '''
         Get the Bayesian log prior for a parameter vector `x`. 
         
@@ -355,14 +360,22 @@ class LnPriorManager(LogisticParameterManager):
         # Logistic jacobians
         for logistic_param in self.logistic_parameters:
             lnprior += logistic_param.ln_prior_weight(phys_dict[logistic_param.physical_name])
-
+        if use_lvk_mass_and_time_prior:
+            # Previous line makes the prior flat in M and q and this term [M / (q + 1)**2] makes it flat in det frame masses
+            lnprior += np.log(phys_dict['total_mass']) - 2.0 * np.log1p(phys_dict['mass_ratio'])
         # cartesian angle terms
         for cartesian_param in self.cartesian_angles:
             lnprior += cartesian_param.ln_prior_weight(x_dict[cartesian_param.x_name], x_dict[cartesian_param.y_name])
 
         # Gaussian
         if self.vary_time:
-            lnprior -= 0.5 * ((phys_dict['geocenter_time'] - self.reference_time) ** 2) / (self.sigma_time ** 2)
+            if not(use_lvk_mass_and_time_prior):
+                lnprior -= 0.5 * ((phys_dict['geocenter_time'] - self.reference_time) ** 2) / (self.sigma_time ** 2)
+            else:
+                delta_t = 0.15 # 2 times of 75 ms, which is what is typically used
+                lnprior += np.log(1./delta_t)
+                if abs(phys_dict['geocenter_time'] - self.reference_time) > delta_t/2:
+                    return -np.inf
 
         # Spins
         if not self.no_spins:
@@ -672,6 +685,7 @@ class LnLikelihoodManager(LogisticParameterManager):
         self.only_prior = only_prior
         self.whitened_data_dict = self._make_whitened_data_dict()
         self.waveform_manager = WaveformManager(self.ifos, *args, **kwargs)
+        self.use_lvk_mass_and_time_prior=kwargs.pop('use_lvk_mass_and_time_prior', False)
         self.log_prior = LnPriorManager(*args, **kwargs)
         
         # Express inverse covariance matrix using Gohberg-Semencul theorem
@@ -826,12 +840,16 @@ class LnLikelihoodManager(LogisticParameterManager):
         # Initialize posterior to 0
         lnprob = 0
 
-        # Calculate posterior
+        # Calculate prior
+        lnprob += self.log_prior.get_lnprior(x, phys_dict=x_phys, use_lvk_mass_and_time_prior=self.use_lvk_mass_and_time_prior)
+        # right now lnprob is just the prior so check if it is finite
+        if not np.isfinite(lnprob):
+            return -np.inf
+        
+        # Calculate posterior by adding lnL
         if not self.only_prior:
             lnprob += self.get_log_likelihood(x_phys, verbose=verbose)
 
-        # Calculate prior
-        lnprob += self.log_prior.get_lnprior(x, phys_dict=x_phys)
 
         # Check for NaN
         if lnprob != lnprob:
