@@ -177,6 +177,8 @@ def create_run_sampler_arg_parser():
     p.add_argument('--time-prior-sigma', type=float, default=0.01, 
                    help="Standard deviation of time prior [s.]"
                         "Default: 0.01 s")
+    p.add_argument('--use-lvk-mass-and-time-prior', default=False, action='store_true', 
+                       help="Use uniform in det frame mass and time prior.")
 
     # Do we want to resume an old run?
     p.add_argument('--resume', action='store_true',
@@ -566,7 +568,7 @@ def get_initial_walkers(likelihood_manager, args, nwalkers, ndim,
 
     # If not Case 2B or 2C, initialize walkers using the function in the likelihood_manager, and return those
     p0 = likelihood_manager.log_prior.initialize_walkers(
-        nwalkers, reference_parameters, reference_posterior=initial_walker_dist, verbose=True
+        nwalkers, reference_parameters, reference_posterior=initial_walker_dist, verbose=True, use_lvk_mass_and_time_prior=args.use_lvk_mass_and_time_prior
     )
     return p0
 
@@ -605,6 +607,7 @@ def main():
         vary_time=args.vary_time, vary_skypos=args.vary_skypos,
         f_max=args.fmax,
         only_prior=args.only_prior,
+        use_lvk_mass_and_time_prior=args.use_lvk_mass_and_time_prior,
         **kwargs
     )
 
