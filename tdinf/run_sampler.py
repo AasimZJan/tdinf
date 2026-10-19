@@ -161,6 +161,14 @@ def create_run_sampler_arg_parser():
                    help = 'Include flag if you want to sample over sky position parameters '
                            '(right ascension, declination, and polarization).')
 
+    # Do we want to sample in eccentric parameters?
+    p.add_argument('--eccentric-analysis', action='store_true',
+                   help = 'Include flag if you want to sample over eccentric parameters.')
+
+    # Do we want an aligned spin analysis?
+    p.add_argument('--aligned-spin-analysis', action='store_true',
+                       help = 'Include flag if you want to the sampler to assume the analysis is aligned-spin.')
+
     # Set up prior bounds
     p.add_argument('--total-mass-prior-bounds', type=float, nargs=2, default=[200, 350],
                    help="detector frame total mass bounds (in solar masses) for total_mass prior."
@@ -179,7 +187,10 @@ def create_run_sampler_arg_parser():
                         "Default: 0.01 s")
     p.add_argument('--use-lvk-mass-and-time-prior', default=False, action='store_true', 
                        help="Use uniform in det frame mass and time prior.")
-
+    p.add_argument('--eccentricity-prior-bounds', type=float, nargs=2, default=[0.0, 0.4],
+                       help="eccentricity bounds for eccentricity prior."
+                            "Default: [0.0, 0.4]")
+    
     # Do we want to resume an old run?
     p.add_argument('--resume', action='store_true',
                    help = 'Include flag if you want the run to pick up from a previous un-finished run, '
@@ -365,6 +376,10 @@ def initialize_kwargs(args, reference_parameters):
         'geocenter_time': reference_parameters['geocenter_time'],
         'verbose': args.verbose,
     }
+
+    if args.eccentric_analysis:
+        kwargs.update({'ecc_lim': args.eccentricity_prior_bounds})
+
     return kwargs
 
 def make_waveform_manager(args, **kwargs):
@@ -372,7 +387,8 @@ def make_waveform_manager(args, **kwargs):
     Generate waveform manager (see utils.likelihood.WaveformManger) from args and kwargs
     '''
     return utils.WaveformManager(
-        args.ifos,vary_time=args.vary_time,vary_skypos=args.vary_skypos,**kwargs
+        args.ifos,vary_time=args.vary_time,vary_skypos=args.vary_skypos,eccentric_analysis=args.eccentric_analysis,aligned_spin_analysis=args.aligned_spin_analysis, 
+        **kwargs
     )
 
 def get_conditioned_time_and_data(args, wf_manager, reference_parameters, initial_run_dir='', verbose=False):
@@ -580,7 +596,8 @@ def main():
     args = p.parse_args()
     verbose = args.verbose
 
-    backend_path = args.output_h5  # where emcee spits its output
+     # where emcee saves its output
+    backend_path = args.output_h5 
 
     # get reference parameters
     reference_parameters, ref_pe_samples = get_injected_parameters(args, verbose=verbose)
@@ -608,6 +625,7 @@ def main():
         f_max=args.fmax,
         only_prior=args.only_prior,
         use_lvk_mass_and_time_prior=args.use_lvk_mass_and_time_prior,
+        eccentric_analysis=args.eccentric_analysis, aligned_spin_analysis=args.aligned_spin_analysis,
         **kwargs
     )
 
