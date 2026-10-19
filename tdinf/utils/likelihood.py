@@ -66,7 +66,7 @@ class LogisticParameterManager:
     - Fixed and sampled parameters
     """
     
-    def __init__(self, vary_time=False, vary_skypos=False, **kwargs):
+    def __init__(self, vary_time=False, vary_skypos=False, eccentric_analysis=False, aligned_spin_analysis=False, **kwargs):
 
         # vary time and sky pos?
         self.vary_time = vary_time
@@ -81,7 +81,15 @@ class LogisticParameterManager:
         # get allowed spin settings of waveform model
         self.aligned_spins, self.no_spins = check_spin_settings_of_approx(kwargs['approx'])
 
-        # get up the logistic parameters which are always sampled over
+        # check if the user has requested aligned-spin analysis; allow aligned-spin analysis for models that support generic spin configurations.
+        # For non-LAL approximants, both are False by default
+        if self.aligned_spins == False and self.no_spins == False:
+            self.aligned_spins = aligned_spin_analysis
+
+        # check if the user has requested eccentric analysis
+        self.eccentric_analysis = eccentric_analysis
+
+        # set up the logistic parameters which are always sampled over
         self.logistic_parameters = [
             LogisticParameter('total_mass', kwargs['mtot_lim'], None),
             LogisticParameter('mass_ratio', kwargs['q_lim'], None),
@@ -97,6 +105,17 @@ class LogisticParameterManager:
                 LogisticParameter('spin1_magnitude', kwargs['chi_lim'], None),
                 LogisticParameter('spin2_magnitude', kwargs['chi_lim'], None)
             ])
+        # include eccentricity parameters if user has requested an eccentric analysis
+        if self.eccentric_analysis:
+            self.logistic_parameters.extend([
+                            LogisticParameter('eccentricity', kwargs['ecc_lim'], None),
+                            ])
+            self.cartesian_angles.extend([
+                            CartesianAngle('mean_anomaly', phase_offset=np.pi),
+                        ])
+        else:
+            self.fixed['eccentricity'] = 0.0
+            self.fixed['mean_anomaly'] = 0.0
 
         # add sky position, if we want to sample it
         if self.vary_skypos:
@@ -119,7 +138,17 @@ class LogisticParameterManager:
         # otherwise, add to fixed parameters 
         else:
             self.fixed['geocenter_time'] = self.reference_time
-        
+
+        # print physical parameter names
+        lines = [
+            "Analysis physical parameters:",
+            f"  Logistic parameters: {', '.join(p.physical_name for p in self.logistic_parameters)}",
+            f"  Cartesian angles:    {', '.join(p.physical_name for p in self.cartesian_angles)}",
+        ]
+        if self.fixed:
+            lines.append(f"  Fixed:               {', '.join(self.fixed)}")
+        print("\n".join(lines))
+
         # generate list of ALL parameters we are sampling over
         self.sampled_keys = [p.logistic_name for p in self.logistic_parameters]
         for cartesian_angle in self.cartesian_angles:
@@ -303,9 +332,13 @@ class LnPriorManager(LogisticParameterManager):
             
             # cycle through logistic params
             for param in logistic_params:
-                                
                 # draw walkers
-                walkers_phys = np.asarray(reference_posterior[param.physical_name])[idxs]
+                column = np.asarray(reference_posterior[param.physical_name]) if param.physical_name in reference_posterior else None
+                if column is None or np.ptp(column) == 0:
+                    print(f"{param.physical_name} is missing or constant in the reference posterior; starting it at random")
+                    continue
+                
+                walkers_phys = column[idxs]
                                  
                 # transform into logistic space
                 walkers_logit = param.physical_to_logistic(walkers_phys) 
@@ -318,8 +351,13 @@ class LnPriorManager(LogisticParameterManager):
 
                 # draw walkers
                 param_kw = param.physical_name
-                walkers_phys = np.asarray(reference_posterior[param_kw])[idxs]
+                column = np.asarray(reference_posterior[param_kw]) if param_kw in reference_posterior else None
+                if column is None or np.ptp(column) == 0:
+                    print(f"{param_kw} is missing or constant in the reference posterior; starting it at random")
+                    continue
                 
+                walkers_phys = column[idxs]
+
                 # get x and y components
                 initial_x, initial_y = param.radian_to_cartesian(walkers_phys) 
                 
@@ -347,6 +385,9 @@ class LnPriorManager(LogisticParameterManager):
         - Uniform in the sine of the declination.
         - Gaussian distributed around the geocenter reference time with a
           standard deviation provided by the user. 
+        - use_lvk_mass_and_time_prior: sets prior uniform in detector frame 
+          masses and time (+/- 0.075 s around reference time).
+        - uniform in eccentricity and mean anomaly
         '''
 
         # Convert `x` from an array to a dictionary
@@ -504,7 +545,7 @@ class WaveformManager(LogisticParameterManager):
         self.antenna_and_time_manager = AntennaAndTimeManager(ifos, *args, **kwargs)
 
     def generate_lal_hphc(self, m1_msun, m2_msun, chi1, chi2, delta_t, dist_mpc=1,
-                          f22_start=20, f_ref=11, inclination=0, phi_ref=0.,NR_kws=None):
+                          f22_start=20, f_ref=11, inclination=0, phi_ref=0.,NR_kws=None, eccentricity=0, mean_anomaly=0):
         """
         Generate the plus and cross polarizations for given waveform parameters and approximant
         """
@@ -546,7 +587,7 @@ class WaveformManager(LogisticParameterManager):
                                                     chi1[0], chi1[1], chi1[2],
                                                     chi2[0], chi2[1], chi2[2],
                                                     distance, inclination,
-                                                    phi_ref, ascending_node, 0, 0,
+                                                    phi_ref, ascending_node, eccentricity, mean_anomaly,
                                                     delta_t, f22_start, f_ref,
                                                     param_dict,
                                                     self.approximant)
@@ -559,6 +600,8 @@ class WaveformManager(LogisticParameterManager):
                 print("m2_kg =", m2_kg)
                 print("chi1 =", chi1)
                 print("chi2 =", chi2)
+                print("eccentricity =", eccentricity)
+                print("mean_anomaly =", mean_anomaly)
                 print("distance =", distance)
                 print("inclination =", inclination)
                 print("phi_ref =", phi_ref)
@@ -582,13 +625,15 @@ class WaveformManager(LogisticParameterManager):
         m1, m2 = m1m2_from_mtotq(x_phys['total_mass'], x_phys['mass_ratio'])
         chi1 = [x_phys['spin1_x'], x_phys['spin1_y'], x_phys['spin1_z']]
         chi2 = [x_phys['spin2_x'], x_phys['spin2_y'], x_phys['spin2_z']]
+        eccentricity, mean_anomaly = x_phys.get('eccentricity', 0.0), x_phys.get('mean_anomaly', 0.0)
 
         if self.backend is not None:
             hp, hc = self.backend.get_hphc(
                 m1, m2, chi1, chi2, delta_t=delta_t,
                 dist_mpc=x_phys['luminosity_distance'],
                 f22_start=f22_start, f_ref=f_ref,
-                inclination=x_phys['inclination'], phi_ref=x_phys['phase']
+                inclination=x_phys['inclination'], phi_ref=x_phys['phase'],
+                eccentricity=eccentricity, mean_anomaly=mean_anomaly
             )
             # for catching waveform errors
             if isinstance(hp, float) and hp!=hp:
@@ -600,7 +645,8 @@ class WaveformManager(LogisticParameterManager):
                                         dist_mpc=x_phys['luminosity_distance'],
                                         f22_start=f22_start, f_ref=f_ref,
                                         inclination=x_phys['inclination'],
-                                        phi_ref=x_phys['phase'],NR_kws=NR_kws)
+                                        phi_ref=x_phys['phase'],NR_kws=NR_kws,
+                                        eccentricity=eccentricity, mean_anomaly=mean_anomaly)
         
         # for catching waveform errors
         if isinstance(hp, float) and hp!=hp:
@@ -685,7 +731,7 @@ class LnLikelihoodManager(LogisticParameterManager):
         self.only_prior = only_prior
         self.whitened_data_dict = self._make_whitened_data_dict()
         self.waveform_manager = WaveformManager(self.ifos, *args, **kwargs)
-        self.use_lvk_mass_and_time_prior=kwargs.pop('use_lvk_mass_and_time_prior', False)
+        self.use_lvk_mass_and_time_prior=kwargs.get('use_lvk_mass_and_time_prior', False)
         self.log_prior = LnPriorManager(*args, **kwargs)
         
         # Express inverse covariance matrix using Gohberg-Semencul theorem
