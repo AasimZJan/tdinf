@@ -5,7 +5,7 @@ matplotlib (and h5py to read files).
 
 Defaults: NO thinning and NO burn-in. Everything is computed on the chain exactly
 as it is in the file. The estimated burn-in is shown (dashed line, Burn-in section)
-and the Burn-in section shows how R-hat, N/tau and drift change as steps are
+and the Burn-in section shows how N/tau and drift change as steps are
 discarded, but nothing is discarded unless you ask (burn=... / thin=...).
 
 With run_sampler.py
@@ -27,7 +27,7 @@ What is checked
 * walkers: fraction of steps moved, longest frozen run, low-lnp outliers,
   parameter offsets relative to the other walkers;
 * convergence: integrated autocorrelation time (emcee-style) and N/tau, the
-  autocorrelation function itself, tau-based ESS, rank-normalised split R-hat,
+  autocorrelation function itself, tau-based ESS,
   half-vs-half drift, acceptance;
 * burn-in: estimated plateau start, and the statistics as a function of the
   number of steps discarded.
@@ -42,8 +42,8 @@ blocks, FFTs are done in walker blocks to bound memory, and plots draw at most
 ~1200 points per line. A very large run therefore costs time (minutes) rather
 than failing; if memory is tight use thin= (tau is scaled back by the stride).
 
-Caveat: walkers of an affine-invariant ensemble are not independent chains, so
-R-hat across walkers is a heuristic. N > 50 tau is the primary criterion.
+Caveat: walkers of an affine-invariant ensemble are not independent chains.
+N > 50 tau is the primary criterion.
 """
 import argparse
 import base64
@@ -58,8 +58,7 @@ import time
 from contextlib import contextmanager
 
 import numpy as np
-from scipy.special import ndtri
-from scipy.stats import binom, rankdata
+from scipy.stats import binom
 
 import matplotlib
 matplotlib.use("Agg")
@@ -68,7 +67,7 @@ from matplotlib.gridspec import GridSpec               # noqa: E402
 from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator   # noqa: E402
 
 __all__ = ["Run", "read_emcee_h5", "analyze", "build_report", "get_layout", "candidate_layouts", "detect_layout", "TDINF_DEFAULT_BOUNDS", "FLAG_RULES_VERSION",
-           "decode_samples", "integrated_autocorr_time", "mean_acf", "split_rhat", "rhat_bulk_tail",
+           "decode_samples", "integrated_autocorr_time", "mean_acf",
            "estimate_burnin", "burn_scan", "report_from_args", "infer_layout_from_file"]
 
 # ============================================================================== style
@@ -98,22 +97,27 @@ def _style():
 
 # ============================================================================== tdinf layout and decoding
 
-def get_layout(spin_model, vary_skypos, vary_time):
+def get_layout(spin_model, vary_skypos, vary_time, eccentric=False):
     """
     Names of the columns of a tdinf emcee chain, in order (identical to tdinf's `sampled_keys`).
     Logistic-transformed parameters carry the prefix x_; angles are stored as (x, y) pairs;
     c1_*, c2_* are spin direction vectors.
 
-    spin_model : 'precessing', 'aligned' or 'none';  vary_skypos, vary_time : bool
+    spin_model : 'precessing', 'aligned' or 'none';  vary_skypos, vary_time, eccentric : bool
+    (eccentric: the run sampled eccentricity and mean anomaly, i.e. run_sampler's --eccentric-analysis)
     """
     if spin_model not in ("precessing", "aligned", "none"):
         raise ValueError("spin_model must be 'precessing', 'aligned' or 'none'")
     keys = ["x_total_mass", "x_mass_ratio", "x_luminosity_distance", "x_cos_inclination"]
     if spin_model != "none":
         keys += ["x_spin1_magnitude", "x_spin2_magnitude"]
+    if eccentric:
+        keys += ["x_eccentricity"]
     if vary_skypos:
         keys += ["x_sin_declination"]
     keys += ["phase_x", "phase_y"]
+    if eccentric:
+        keys += ["mean_anomaly_x", "mean_anomaly_y"]
     if vary_skypos:
         keys += ["right_ascension_x", "right_ascension_y", "polarization_x", "polarization_y"]
     if spin_model == "precessing":
@@ -126,23 +130,23 @@ def get_layout(spin_model, vary_skypos, vary_time):
 
 
 def candidate_layouts(ndim):
-    """All (spin_model, vary_skypos, vary_time) configurations that give `ndim` columns."""
+    """All (spin_model, vary_skypos, vary_time, eccentric) configurations that give `ndim` columns."""
     out = []
-    for spin_model, sky, time_ in itertools.product(("precessing", "aligned", "none"), (False, True), (False, True)):
-        if len(get_layout(spin_model, sky, time_)) == ndim:
-            out.append(dict(spin_model=spin_model, vary_skypos=sky, vary_time=time_))
+    for spin_model, sky, time_, ecc in itertools.product(("precessing", "aligned", "none"), (False, True), (False, True), (False, True)):
+        if len(get_layout(spin_model, sky, time_, ecc)) == ndim:
+            out.append(dict(spin_model=spin_model, vary_skypos=sky, vary_time=time_, eccentric=ecc))
     return out
 
 
 # Prior bounds that tdinf's run_sampler uses unless the command line changes them. They are NOT stored in the h5 file.
-TDINF_DEFAULT_BOUNDS = dict(mtot_lim=(200, 350), q_lim=(0.17, 1), dist_lim=(100, 10000), chi_lim=(0, 0.99))
+TDINF_DEFAULT_BOUNDS = dict(mtot_lim=(200, 350), q_lim=(0.17, 1), dist_lim=(100, 10000), chi_lim=(0, 0.99), ecc_lim=(0.0, 0.4))
 
 
 def detect_layout(names):
-    """If `names` is a tdinf column layout, return dict(spin_model, vary_skypos, vary_time); otherwise None."""
-    for spin_model, sky, time_ in itertools.product(("precessing", "aligned", "none"), (False, True), (False, True)):
-        if list(names) == get_layout(spin_model, sky, time_):
-            return dict(spin_model=spin_model, vary_skypos=sky, vary_time=time_)
+    """If `names` is a tdinf column layout, return dict(spin_model, vary_skypos, vary_time, eccentric); otherwise None."""
+    for spin_model, sky, time_, ecc in itertools.product(("precessing", "aligned", "none"), (False, True), (False, True), (False, True)):
+        if list(names) == get_layout(spin_model, sky, time_, ecc):
+            return dict(spin_model=spin_model, vary_skypos=sky, vary_time=time_, eccentric=ecc)
     return None
 
 
@@ -155,22 +159,23 @@ def _inv_logit(y, lo, hi):
 
 
 def decode_samples(chain, spin_model, vary_skypos, vary_time, mtot_lim, q_lim, dist_lim, chi_lim,
-                   fixed=None, f_ref=None, check_layout=True):
+                   fixed=None, f_ref=None, check_layout=True, eccentric=False, ecc_lim=(0.0, 0.4)):
     """
     Convert sampled numbers (last axis = columns of get_layout) into physical parameters.
 
     mtot_lim, q_lim, dist_lim, chi_lim : (low, high) prior bounds of the run (from its command line).
+    eccentric, ecc_lim : the run sampled eccentricity and mean anomaly (--eccentric-analysis) and the eccentricity bounds.
     fixed : values of parameters that were not sampled: 'right_ascension', 'declination', 'polarization'
             (if not vary_skypos) and 'geocenter_time' (if not vary_time).
     f_ref : if given and lalsimulation is installed, theta_jn, phi_jl, tilt1, tilt2, phi12 come from LAL;
             otherwise tilt1, tilt2, phi12 are computed analytically and theta_jn, phi_jl are omitted.
     Returns a dict of arrays with the shape of chain[..., 0].
     Conventions are those of tdinf: logistic x = lo + (hi - lo) * sigmoid(y); inclination = arccos(...),
-    declination = arcsin(...); angles = arctan2(y, x) (+ pi for right_ascension); spin = magnitude * c / |c|.
+    declination = arcsin(...); angles = arctan2(y, x) (+ pi for right_ascension and mean_anomaly); spin = magnitude * c / |c|.
     """
     fixed = {} if fixed is None else fixed
     chain = np.asarray(chain, dtype=float)
-    keys = get_layout(spin_model, vary_skypos, vary_time)
+    keys = get_layout(spin_model, vary_skypos, vary_time, eccentric)
     if chain.shape[-1] != len(keys):
         raise ValueError(f"chain has {chain.shape[-1]} columns but this configuration has {len(keys)}: {keys}. "
                          f"Configurations with {chain.shape[-1]} columns: {candidate_layouts(chain.shape[-1])}")
@@ -188,6 +193,9 @@ def decode_samples(chain, spin_model, vary_skypos, vary_time, mtot_lim, q_lim, d
     out["luminosity_distance"] = _inv_logit(col["x_luminosity_distance"], *dist_lim)
     out["inclination"] = np.arccos(_inv_logit(col["x_cos_inclination"], -1.0, 1.0))
     out["phase"] = np.arctan2(col["phase_y"], col["phase_x"])
+    if eccentric:
+        out["eccentricity"] = _inv_logit(col["x_eccentricity"], *ecc_lim)
+        out["mean_anomaly"] = np.arctan2(col["mean_anomaly_y"], col["mean_anomaly_x"]) + np.pi
     out["mass_1"] = out["total_mass"] / (1.0 + out["mass_ratio"])
     out["mass_2"] = out["total_mass"] - out["mass_1"]
     out["chirp_mass"] = (out["mass_1"] * out["mass_2"]) ** 0.6 / out["total_mass"] ** 0.2
@@ -265,7 +273,7 @@ def _spin_angles(p, f_ref):
 
 _PHYSICAL_KEYS = ["total_mass", "mass_ratio", "mass_1", "mass_2", "chirp_mass", "luminosity_distance", "inclination", "phase",
                   "spin1_magnitude", "spin2_magnitude", "chi_eff", "chi_p", "tilt1", "tilt2", "phi12", "right_ascension",
-                  "declination", "polarization"]
+                  "declination", "polarization", "eccentricity", "mean_anomaly"]
 
 
 # ============================================================================== data container
@@ -371,7 +379,7 @@ class Run:
             self.derived_names.append(k)
 
     def add_physical(self, spin_model, vary_skypos, vary_time, mtot_lim, q_lim, dist_lim, chi_lim,
-                     fixed=None, keys=None, block=2000):
+                     fixed=None, keys=None, block=2000, eccentric=False, ecc_lim=(0.0, 0.4)):
         """
         Add physical parameters decoded from the sampled numbers (tdinf layout), computed in blocks of
         `block` steps so that memory stays bounded. `keys` defaults to masses (including the chirp mass), distance,
@@ -379,7 +387,7 @@ class Run:
         Every column needs steps x walkers x 4 bytes of memory; pass `keys` to limit them on very large runs.
         """
         self.physical_info = dict(mtot_lim=tuple(mtot_lim), q_lim=tuple(q_lim), dist_lim=tuple(dist_lim), chi_lim=tuple(chi_lim),
-                                  fixed=dict(fixed or {}), auto=False)
+                                  ecc_lim=tuple(ecc_lim), eccentric=bool(eccentric), fixed=dict(fixed or {}), auto=False)
         want = list(keys) if keys else [k for k in _PHYSICAL_KEYS
                                          if vary_skypos or k not in ("right_ascension", "declination", "polarization")]
         want = [k for k in want if not (spin_model == "none" and k in ("spin1_magnitude", "spin2_magnitude", "chi_eff", "chi_p", "tilt1", "tilt2", "phi12"))]
@@ -387,7 +395,7 @@ class Run:
         for b0 in range(0, self.n, block):
             blk = self.x[b0:b0 + block].astype(np.float64) + self.offsets      # true values, offsets added back
             dec = decode_samples(blk, spin_model, vary_skypos, vary_time, mtot_lim, q_lim,
-                                 dist_lim, chi_lim, fixed=fixed, check_layout=(b0 == 0))
+                                 dist_lim, chi_lim, fixed=fixed, check_layout=(b0 == 0), eccentric=eccentric, ecc_lim=ecc_lim)
             for k in want:
                 if k in dec:
                     out.setdefault(k, np.empty((self.n, self.nwalkers), dtype=np.float32))[b0:b0 + block] = dec[k]
@@ -542,32 +550,6 @@ def integrated_autocorr_time(x, c=5.0):
     return float(taus[auto_window(taus, c)])
 
 
-def _rank_normalize(x):
-    r = rankdata(x.ravel(), method="average").reshape(x.shape)
-    return ndtri((r - 0.375) / (x.size + 0.25))
-
-
-def split_rhat(x):
-    """Split R-hat for x (n, nchains): every chain is cut in two halves."""
-    n = x.shape[0] // 2
-    if n < 4 or x.shape[1] < 2:
-        return np.nan
-    ch = np.concatenate([x[:n], x[n:2 * n]], axis=1)
-    W = ch.var(axis=0, ddof=1).mean()
-    if W <= 0:
-        return np.nan
-    B = n * ch.mean(axis=0).var(ddof=1)
-    return float(np.sqrt(((n - 1) / n * W + B / n) / W))
-
-
-def rhat_bulk_tail(x):
-    """Rank-normalised split R-hat (Vehtari et al. 2021): returns (bulk, tail)."""
-    x = np.asarray(x, dtype=np.float64)
-    bulk = split_rhat(_rank_normalize(x))
-    tail = split_rhat(_rank_normalize(np.abs(x - np.median(x))))
-    return bulk, tail
-
-
 def drift_z(x, tau):
     """Difference of the means of the two halves, in standard errors (tau gives the effective sample size)."""
     n, w = x.shape
@@ -672,9 +654,9 @@ def burn_scan(run, an, fractions=(0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5), ma
               tau_c=5.0, seed=0):
     """
     How the convergence statistics change when the first part of the chain is discarded.
-    For each fraction, R-hat, N/tau and drift are computed on what is left. For speed this scan uses at most
+    For each fraction, N/tau and drift are computed on what is left. For speed this scan uses at most
     `max_rows` evenly spaced steps and `max_walkers` unflagged walkers (N/tau is unaffected by thinning).
-    Returns a dict of arrays: step (steps discarded), frac, rhat (max), n_over_tau (min), drift (max |z|), plateau.
+    Returns a dict of arrays: step (steps discarded), frac, n_over_tau (min), drift (max |z|), plateau.
     """
     rng = np.random.default_rng(seed)
     keep = np.nonzero(_keep_mask(an))[0]
@@ -683,22 +665,19 @@ def burn_scan(run, an, fractions=(0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5), ma
     rows = np.arange(0, run.n, sstride)
     cols = {nm: _fill_nan(run.columns[nm][rows][:, walkers]) for nm in run.names}
     lnp_s = run.lnp[rows][:, walkers]
-    out = {k: [] for k in ("step", "frac", "rhat", "n_over_tau", "drift", "plateau")}
+    out = {k: [] for k in ("step", "frac", "n_over_tau", "drift", "plateau")}
     for f in fractions:
         b = int(round(f * len(rows)))
         if len(rows) - b < 60:
             continue
-        rh, no, dz = [], [], []
+        no, dz = [], []
         for nm in run.names:
             x = cols[nm][b:]
             tau = integrated_autocorr_time(x, tau_c)
-            rb, rt = rhat_bulk_tail(x)
-            rh.append(np.nanmax([rb, rt]) if np.isfinite([rb, rt]).any() else np.nan)
             no.append(x.shape[0] / tau if np.isfinite(tau) and tau > 0 else np.nan)
             dz.append(abs(drift_z(x, tau)))
         out["step"].append(int(run.steps[rows[b]]))
         out["frac"].append(b / len(rows))
-        out["rhat"].append(np.nanmax(rh) if np.isfinite(rh).any() else np.nan)
         out["n_over_tau"].append(np.nanmin(no) if np.isfinite(no).any() else np.nan)
         out["drift"].append(np.nanmax(dz) if np.isfinite(dz).any() else np.nan)
         out["plateau"].append(float(np.nanmedian(lnp_s[b:])))
@@ -746,10 +725,6 @@ def _diagnose(an, run):
     elif short:
         v, nm = min(n_over)
         obs.append(f"The chain is {v:.1f} autocorrelation times long for {nm}; 50 or more is wanted before the statistics can be trusted.")
-    rh = [r_["rhat"] for r_ in rows if np.isfinite(r_["rhat"])]
-    rc = [r_["rhat_clean"] for r_ in rows if np.isfinite(r_["rhat_clean"])]
-    if rh and rc and max(rh) > 1.05 and max(rc) < 1.05:
-        obs.append(f"R-hat falls from {max(rh):.2f} to {max(rc):.2f} when the flagged walkers are left out, so they account for most of the disagreement between walkers.")
 
     # ---- what to try
     if short:
@@ -786,7 +761,7 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
     """
     Run all diagnostics. Returns a dict used by the plotting and report functions.
 
-    burn : what to DISCARD before computing tau, R-hat, ESS and drift.
+    burn : what to DISCARD before computing tau, ESS and drift.
            0 (default) = nothing; 'auto' = the estimated burn-in; a float in (0, 1) = that fraction of the
            steps; an int = that many steps (original step units).
     The estimated burn-in is always computed and shown, and it is also used to decide which part of the run
@@ -899,8 +874,6 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
     an["walkers"] = walkers
 
     # ---- per-parameter convergence statistics (on the chain minus the DISCARDED burn-in only)
-    clean = ~flagged
-    use_clean = flagged.any() and clean.sum() >= 4
     rows = []
     for j, nm in enumerate(names):
         if verbose:
@@ -908,27 +881,19 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
         x = _fill_nan(run.columns[nm][bi:])
         tau_thin = integrated_autocorr_time(x, tau_c)
         tau = tau_thin * run.stride
-        rb, rt = rhat_bulk_tail(x)
-        rhat = np.nanmax([rb, rt]) if np.isfinite([rb, rt]).any() else np.nan
-        if use_clean:
-            cb, ct = rhat_bulk_tail(x[:, clean])
-            rclean = np.nanmax([cb, ct]) if np.isfinite([cb, ct]).any() else np.nan
-        else:
-            rclean = np.nan
         ok_tau = np.isfinite(tau) and tau > 0
         n_over_tau = n_post_steps / tau if ok_tau else np.nan
         ess = w * n_post_steps / tau if ok_tau else np.nan
         dz = drift_z(x, tau_thin)
         q05, q50, q95 = np.percentile(x, [5, 50, 95])
         st_tau = _status(n_over_tau, 50, 20, higher_is_better=True)
-        st_rhat = _status(rhat, 1.01, 1.05)
         st_ess = _status(ess, ess_target, ess_target / 2.5, higher_is_better=True)
         st_drift = _status(abs(dz) if np.isfinite(dz) else np.nan, 3, 5)
         res = dict(name=nm, mean=float(x.mean()), std=float(x.std()), q05=float(q05), q50=float(q50), q95=float(q95),
-                   rhat_bulk=rb, rhat_tail=rt, rhat=rhat, rhat_clean=rclean, tau=tau, n_over_tau=n_over_tau, ess=ess,
-                   drift_z=dz, st_tau=st_tau, st_rhat=st_rhat, st_ess=st_ess, st_drift=st_drift,
+                   tau=tau, n_over_tau=n_over_tau, ess=ess,
+                   drift_z=dz, st_tau=st_tau, st_ess=st_ess, st_drift=st_drift,
                    tau_resolved=bool(np.isfinite(tau_thin) and tau_thin >= 3), derived=nm in run.derived_names)
-        res["status"] = _worst(st_tau, st_rhat, st_ess, st_drift)
+        res["status"] = _worst(st_tau, st_ess, st_drift)
         rows.append(res)
     an["params"] = rows
 
@@ -948,7 +913,6 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
 
     # ---- overall checks
     n_over = np.array([r["n_over_tau"] for r in rows], dtype=float)
-    rh = np.array([r["rhat"] for r in rows], dtype=float)
     ess_arr = np.array([r["ess"] for r in rows], dtype=float)
     dz_arr = np.abs(np.array([r["drift_z"] for r in rows], dtype=float))
     acc_med = float(np.nanmedian(accept))
@@ -956,7 +920,7 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
     def pick(arr, fn):
         return int(fn(arr)) if np.isfinite(arr).any() else 0
 
-    wn, wr, we, wd = pick(n_over, np.nanargmin), pick(rh, np.nanargmax), pick(ess_arr, np.nanargmin), pick(dz_arr, np.nanargmax)
+    wn, we, wd = pick(n_over, np.nanargmin), pick(ess_arr, np.nanargmin), pick(dz_arr, np.nanargmax)
     pct = 100.0 * an["est_step"] / max(run.steps[-1] + 1, 1)
     plateau_txt = (f"plateau from step {an['est_step']:,} ({pct:.0f}% of the run)" + (f"; the first {an['burn_step']:,} steps are removed" if bi > 0 else "")
                    if est_found else "no plateau found")
@@ -969,8 +933,6 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
     checks = [
         ("tau", "Chain length vs autocorrelation time", _status(np.nanmin(n_over), 50, 20, True),
          f"min N/tau = {np.nanmin(n_over):.1f} ({names[wn]})", "Good if the chain is at least 50 autocorrelation times long; check from 20; problem below 20."),
-        ("rhat", "Rank-normalised split R-hat", _status(np.nanmax(rh), 1.01, 1.05),
-         f"max R-hat = {np.nanmax(rh):.3f} ({names[wr]})", "Good below 1.01; check up to 1.05; problem above 1.05."),
         ("ess", "Effective sample size", _status(np.nanmin(ess_arr), ess_target, ess_target / 2.5, True),
          f"min ESS = {np.nanmin(ess_arr):.0f} ({names[we]})", f"Good at {ess_target} or more independent samples; check from {ess_target / 2.5:.0f}; problem below that."),
         ("drift", "Half-vs-half drift of the means", _status(np.nanmax(dz_arr), 3, 5),
@@ -1285,10 +1247,7 @@ def plot_traces(run, an, params=None, per_page=5, max_pts=1200):
                 _offscale(at, an, fl_vals, "walker {i}: {v:.4g}")
                 at.set_ylabel(nm, fontsize=10)
                 info = prm[nm]
-                txt = f"tau={_fmt(info['tau'])}   N/tau={_fmt(info['n_over_tau'])}   R-hat={_fmt(info['rhat'])}"
-                if np.isfinite(info["rhat_clean"]):
-                    txt += f" (without flagged: {_fmt(info['rhat_clean'])})"
-                txt += f"   ESS={_fmt(info['ess'])}"
+                txt = f"tau={_fmt(info['tau'])}   N/tau={_fmt(info['n_over_tau'])}   ESS={_fmt(info['ess'])}"
                 at.text(0.01, 0.97, txt, transform=at.transAxes, va="top", fontsize=8,
                         color={"ok": C["green"], "warn": C["amber"], "bad": C["red"], "na": C["gray"]}[info["status"]],
                         bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.5))
@@ -1344,21 +1303,15 @@ def plot_autocorr(an):
     return fig
 
 
-def plot_rhat_ess(an):
-    """R-hat and ESS for every parameter, coloured by status."""
+def plot_tau_ess(an):
+    """N/tau and ESS for every parameter, coloured by status."""
     rows = an["params"]
     names = [r["name"] for r in rows]
     cols = {"ok": C["green"], "warn": C["amber"], "bad": C["red"], "na": C["gray"]}
     with _style():
         h = max(3.2, 0.28 * len(rows) + 1.2)
-        fig, (a1, a2, a3) = plt.subplots(1, 3, figsize=(11, h), sharey=True)
+        fig, (a2, a3) = plt.subplots(1, 2, figsize=(11, h), sharey=True)
         y = np.arange(len(rows))
-        rh = np.array([r["rhat"] for r in rows], dtype=float)
-        a1.barh(y, np.nan_to_num(rh - 1, nan=0), left=1, color=[cols[r["st_rhat"]] for r in rows])
-        a1.axvline(1.01, color=C["ink"], ls=":", lw=1)
-        a1.axvline(1.05, color=C["ink"], ls="--", lw=1)
-        a1.set_xlim(0.99, max(1.08, np.nanmax(rh) * 1.01 if np.isfinite(rh).any() else 1.08))
-        a1.set_title("rank-normalised split R-hat", loc="left", fontsize=10)
         no = np.array([r["n_over_tau"] for r in rows], dtype=float)
         a2.barh(y, np.nan_to_num(no, nan=0), color=[cols[r["st_tau"]] for r in rows])
         a2.axvline(50, color=C["ink"], ls="--", lw=1)
@@ -1366,9 +1319,9 @@ def plot_rhat_ess(an):
         es = np.array([r["ess"] for r in rows], dtype=float)
         a3.barh(y, np.nan_to_num(es, nan=0), color=[cols[r["st_ess"]] for r in rows])
         a3.set_title("effective sample size", loc="left", fontsize=10)
-        a1.set_yticks(y)
-        a1.set_yticklabels(names)
-        a1.invert_yaxis()
+        a2.set_yticks(y)
+        a2.set_yticklabels(names)
+        a2.invert_yaxis()
         fig.tight_layout()
     return fig
 
@@ -1442,13 +1395,13 @@ def plot_flagged(run, an, max_walkers=6):
 def plot_burnin(run, an):
     """
     Top: ln p relative to the late-run plateau against log(step), so the climb is visible whatever its length.
-    Bottom: what R-hat, N/tau and drift would be if the first part of the run were discarded.
+    Bottom: what N/tau and drift would be if the first part of the run were discarded.
     Purple dashed = estimated burn-in; the green shading marks the good region of each statistic.
     """
     sc = an.get("burn_scan")
     with _style():
         fig = plt.figure(figsize=(11, 7.4))
-        gs = GridSpec(2, 3, height_ratios=[1.3, 1], hspace=0.45, wspace=0.32, figure=fig,
+        gs = GridSpec(2, 2, height_ratios=[1.3, 1], hspace=0.45, wspace=0.28, figure=fig,
                       left=0.07, right=0.98, top=0.95, bottom=0.08)
         ax = fig.add_subplot(gs[0, :])
         n = run.n
@@ -1488,8 +1441,7 @@ def plot_burnin(run, an):
         ax.set_title("Approach to the plateau", loc="left")
         ax.legend(ncol=2, loc="upper left")
         if sc is not None and len(sc["step"]) > 1:
-            panels = [("R-hat, worst parameter", sc["rhat"], 1.01, 1.05, False, False, "1.01: good below", "1.05: problem above"),
-                      ("N / tau, worst parameter", sc["n_over_tau"], 50, 20, True, True, "50: good above", "20: problem below"),
+            panels = [("N / tau, worst parameter", sc["n_over_tau"], 50, 20, True, True, "50: good above", "20: problem below"),
                       ("|drift z|, worst parameter", sc["drift"], 3, 5, False, False, "3: good below", "5: problem above")]
             for k, (ttl, y, good, bad, higher, logy, glab, blab) in enumerate(panels):
                 a = fig.add_subplot(gs[1, k])
@@ -1731,8 +1683,15 @@ img{max-width:100%;height:auto;background:#fff;border-radius:8px;border:1px soli
 #ex-canvas,#lp-canvas,#pd-hist,#pd-cat,#hh-canvas,#fw-canvas{width:100%;display:block;background:#fff;border-radius:8px} #fw-canvas{height:360px}
 .controls button{padding:3px 12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);cursor:pointer} #ex-canvas{height:380px} #lp-canvas{height:430px} #pd-hist,#pd-cat{height:380px} #hh-canvas{height:340px}
 #hh-stats table{width:auto;font-size:12.5px;margin-top:8px} #hh-stats th{cursor:default}
-table.args{table-layout:fixed;width:100%} table.args th,table.args td{white-space:normal;text-align:left;vertical-align:top;overflow-wrap:anywhere;line-height:1.4}
-table.args td:first-child{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+.argcols{columns:2 400px;column-gap:12px;margin-top:8px}
+.argcard{break-inside:avoid;border:1px solid var(--line);border-radius:10px;padding:7px 10px 8px;margin:0 0 10px}
+.argcard h4{margin:0 0 3px;font-size:13px}
+table.argc{table-layout:auto;width:100%;font-size:12.5px}
+table.argc td{padding:2px 8px 2px 0;white-space:normal;text-align:left;vertical-align:top;line-height:1.35}
+table.argc td:first-child{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:nowrap;color:var(--muted);width:1%}
+table.argc .line{overflow-wrap:anywhere} table.argc .line.path{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:290px}
+.argcard .unset{margin:4px 0 0;font-size:12px;color:var(--muted);line-height:1.5}
+.argcard .unset span{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;white-space:nowrap}
 pre.cmd{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--line);padding:10px 12px;border-radius:8px;font-size:12.5px;margin:8px 0}
 table.checks{table-layout:fixed} table.checks th,table.checks td{white-space:normal;text-align:left;vertical-align:top;overflow-wrap:anywhere;line-height:1.4}
 @media (max-width:1150px){table.checks colgroup,table.checks thead{display:none} table.checks,table.checks tbody,table.checks tr,table.checks td{display:block;width:100%} table.checks tr{border-bottom:1px solid var(--line);padding:8px 0} table.checks td{border:0;padding:2px 0} table.checks td[data-l]::before{content:attr(data-l) \": \";color:var(--muted);font-size:12px}}
@@ -1751,14 +1710,13 @@ def _cell(text, cls="", val=None):
 
 
 def _params_table(an):
-    head = ["parameter", "mean", "std", "5%", "median", "95%", "R-hat", "R-hat (clean)", "tau", "N/tau", "ESS", "drift z", "status"]
+    head = ["parameter", "mean", "std", "5%", "median", "95%", "tau", "N/tau", "ESS", "drift z", "status"]
     out = ['<div class="scroll"><table class="sortable"><thead><tr>' + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
     for r in an["params"]:
         nm = r["name"] + (" (derived)" if r["derived"] else "")
         tau_txt = _fmt(r["tau"]) + ("" if r["tau_resolved"] else " *")
         out.append("<tr>" + _cell(nm) + _cell(_fmt(r["mean"]), val=r["mean"]) + _cell(_fmt(r["std"]), val=r["std"]) +
                    _cell(_fmt(r["q05"]), val=r["q05"]) + _cell(_fmt(r["q50"]), val=r["q50"]) + _cell(_fmt(r["q95"]), val=r["q95"]) +
-                   _cell(_fmt(r["rhat"]), r["st_rhat"], r["rhat"]) + _cell(_fmt(r["rhat_clean"]), val=r["rhat_clean"]) +
                    _cell(tau_txt, val=r["tau"]) + _cell(_fmt(r["n_over_tau"]), r["st_tau"], r["n_over_tau"]) +
                    _cell(_fmt(r["ess"]), r["st_ess"], r["ess"]) + _cell(_fmt(r["drift_z"]), r["st_drift"], r["drift_z"]) +
                    _cell(r["status"].upper(), r["status"]) + "</tr>")
@@ -2108,10 +2066,8 @@ def _dist_explorer_html(run, an):
 
 
 def _stat_guide_html():
-    """What R-hat, N/tau and drift z mean, with the values to expect."""
-    rows = [("R-hat", "Do all walkers describe the same distribution? Compares the spread between walkers with the spread inside each walker; it is 1 when they agree.",
-             "close to 1, below 1.01", "above 1.05"),
-            ("N / tau", "How long the chain is in units of the autocorrelation time tau, the number of steps a walker needs to forget where it was. Roughly the number of independent samples per walker.",
+    """What N/tau and drift z mean, with the values to expect."""
+    rows = [("N / tau", "How long the chain is in units of the autocorrelation time tau, the number of steps a walker needs to forget where it was. Roughly the number of independent samples per walker.",
              "50 or more", "below 20"),
             ("drift z", "Has the chain stopped moving? The difference between the averages of the first and second half of the chain, in standard errors.",
              "within about 3 (random scatter around 0)", "above 5")]
@@ -2153,8 +2109,8 @@ def select_parameters(run, an, k=6, flag_impact=False):
     Choose which parameters to show instead of showing all of them: ln_posterior first, then the k-1 most informative others.
 
     flag_impact=True (and some walkers flagged): the parameters in which the flagged walkers sit furthest from the rest.
-    Otherwise: the highest concern score, the largest of (R-hat - 1) / 0.05, 50 / (N/tau) and |drift z| / 5
-    (a score of 1 or more means at least one of the three statistics is at its limit).
+    Otherwise: the highest concern score, the larger of 50 / (N/tau) and |drift z| / 5
+    (a score of 1 or more means at least one of the two statistics is at its limit).
     Returns (list of names, dict name -> score).
     """
     rows = {r["name"]: r for r in an["params"]}
@@ -2167,8 +2123,6 @@ def select_parameters(run, an, k=6, flag_impact=False):
     else:
         def concern(r):
             parts = []
-            if np.isfinite(r["rhat"]):
-                parts.append((r["rhat"] - 1.0) / 0.05)
             if np.isfinite(r["n_over_tau"]) and r["n_over_tau"] > 0:
                 parts.append(50.0 / r["n_over_tau"])
             if np.isfinite(r["drift_z"]):
@@ -2532,34 +2486,65 @@ def _reconstruct_command(args_dict):
 
 
 def _arguments_section(arguments, command_line, reference_values, run, an):
-    """The 'Arguments' section: what the run was started with, and what the diagnostics used."""
+    """
+    The 'Arguments' section: what the run was started with, and what the diagnostics used. Kept small: one compact card
+    per group with two columns (argument, value); what an argument means appears when you hover over it, and the
+    arguments that are not set or are off are listed in one line per card.
+    """
     d = None
     if arguments is not None:
         d = dict(vars(arguments)) if hasattr(arguments, "__dict__") else dict(arguments)
-    out = ['<section id="arguments"><h2>Arguments</h2>']
+    cards = []
 
-    def table(rows, head=("argument", "what it is", "value")):
-        t = ['<table class="args"><colgroup><col style="width:27%"><col style="width:40%"><col style="width:33%"></colgroup>'
-             f'<thead><tr><th>{head[0]}</th><th>{head[1]}</th><th>{head[2]}</th></tr></thead><tbody>']
-        for a, m, v in rows:
-            t.append(f"<tr><td>{_html.escape(a)}</td><td>{_html.escape(m)}</td><td>{_html.escape(v)}</td></tr>")
+    def card(title, rows, unset=()):
+        t = [f'<div class="argcard"><h4>{_html.escape(title)}</h4><table class="argc"><tbody>']
+        for name, meaning, value in rows:
+            if isinstance(value, list):                          # several long values (file paths): one line each, cut with ... (full text on hover)
+                cell = "".join(f'<div class="line path" title="{_html.escape(v)}">{_html.escape(v)}</div>' for v in value)
+            else:
+                cell = f'<div class="line">{_html.escape(value)}</div>'
+            t.append(f'<tr><td title="{_html.escape(meaning)}">{_html.escape(name)}</td><td>{cell}</td></tr>')
         t.append("</tbody></table>")
+        if unset:
+            t.append('<p class="unset">not set or off: ' + ", ".join(f"<span>{_html.escape(u)}</span>" for u in unset) + "</p>")
+        t.append("</div>")
         return "".join(t)
 
+    def is_unset(v):
+        return v is None or v is False or (isinstance(v, (list, tuple)) and len(v) == 0)
+
+    def shown(k, v):
+        if isinstance(v, (list, tuple)) and k in ("data", "psd") and len(v) > 1:
+            return [_fmt_arg(x) for x in v]
+        return _fmt_arg(v)
+
+    details = ""
     if d is not None:
-        out.append('<p class="muted">The arguments the run was started with, as parsed (defaults included).</p>')
         used = set()
         for title, entries in _ARG_GROUPS:
-            rows = [(flag, meaning, _fmt_arg(d[k])) for k, flag, meaning in entries if k in d]
+            rows, unset = [], []
+            for k, flag, meaning in entries:
+                if k in d:
+                    if is_unset(d[k]):
+                        unset.append(flag)
+                    else:
+                        rows.append((flag, meaning, shown(k, d[k])))
             used |= {k for k, _, _ in entries}
-            if rows:
-                out.append(f"<h3>{title}</h3>" + table(rows))
-        other = [("--" + k.replace("_", "-"), "", _fmt_arg(v)) for k, v in d.items() if k not in used]
-        if other:
-            out.append("<h3>Other</h3>" + table(other))
+            if rows or unset:
+                cards.append(card(title, rows, unset))
+        rows, unset = [], []
+        for k, v in d.items():
+            if k not in used:
+                flag = "--" + k.replace("_", "-")
+                if is_unset(v):
+                    unset.append(flag)
+                else:
+                    rows.append((flag, "", shown(k, v)))
+        if rows or unset:
+            cards.append(card("Other", rows, unset))
         cmd = command_line if command_line else _reconstruct_command(d)
         label = "Command line" if command_line else "Command line (reconstructed from the parsed arguments)"
-        out.append(f'<details><summary>{label}</summary><pre class="cmd">{_html.escape(cmd)}</pre></details>')
+        details = f'<details><summary>{label}</summary><pre class="cmd">{_html.escape(cmd)}</pre></details>'
 
     if reference_values:
         sky = bool(d.get("vary_skypos")) if d is not None else None
@@ -2569,15 +2554,16 @@ def _arguments_section(arguments, command_line, reference_values, run, an):
         rows = []
         for key, label, sampled in names:
             if key in reference_values:
-                role = ("sampled; this is only the reference value" if sampled else "fixed at this value") if sampled is not None else ""
-                rows.append((key, label + (f": {role}" if role else ""), _fmt_arg(float(reference_values[key]))))
+                role = ("sampled; reference value only" if sampled else "fixed") if sampled is not None else ""
+                rows.append((key, label, _fmt_arg(float(reference_values[key])) + (f" ({role})" if role else "")))
         if rows:
-            out.append("<h3>Reference values used by the run</h3>" + table(rows))
+            cards.append(card("Reference values used by the run", rows))
 
     layout = detect_layout(run.raw_names)
     rows = [("emcee file", "the file these diagnostics were made from", str(run.source)),
             ("steps in the file", "", f"{run.nsteps_total:,}"), ("walkers", "", f"{run.nwalkers}"),
-            ("sampled columns", "numbers sampled per walker", f"{run.ndim}" + (f" ({layout['spin_model']} spins; sky position {'sampled' if layout['vary_skypos'] else 'fixed'}; time {'sampled' if layout['vary_time'] else 'fixed'})" if layout else ""))]
+            ("sampled columns", "numbers sampled per walker", f"{run.ndim}" + (f" ({layout['spin_model']} spins; sky position {'sampled' if layout['vary_skypos'] else 'fixed'}; time {'sampled' if layout['vary_time'] else 'fixed'}"
+                                                                                   + ("; eccentricity sampled" if layout['eccentric'] else "") + ")" if layout else ""))]
     if run.stride > 1:
         rows.append(("steps read", run.thin_note or f"every {_ordinal(run.stride)} step", f"{run.n:,} of {run.nsteps_total:,}"))
     rows.append(("estimated burn-in", "from the ensemble-median ln p", f"step {an['est_step']:,}" if an["est_found"] else "no plateau found"))
@@ -2588,22 +2574,24 @@ def _arguments_section(arguments, command_line, reference_values, run, an):
         rows.append(("prior bounds for the physical parameters",
                      "used to convert the sampled numbers" + (" (tdinf defaults)" if pi["auto"] else ""),
                      f"total mass {pi['mtot_lim'][0]:g} to {pi['mtot_lim'][1]:g}; mass ratio {pi['q_lim'][0]:g} to {pi['q_lim'][1]:g}; "
-                     f"distance {pi['dist_lim'][0]:g} to {pi['dist_lim'][1]:g}; spin magnitude {pi['chi_lim'][0]:g} to {pi['chi_lim'][1]:g}"))
+                     f"distance {pi['dist_lim'][0]:g} to {pi['dist_lim'][1]:g}; spin magnitude {pi['chi_lim'][0]:g} to {pi['chi_lim'][1]:g}"
+                     + (f"; eccentricity {pi['ecc_lim'][0]:g} to {pi['ecc_lim'][1]:g}" if pi.get("eccentric") else "")))
     rows.append(("walker-flag rules", "fixed set of criteria", f"version {FLAG_RULES_VERSION}"))
-    out.append("<h3>What the diagnostics used</h3>" + table(rows, head=("setting", "what it is", "value")))
-    out.append("</section>")
-    return "".join(out)
+    cards.append(card("What the diagnostics used", rows))
+
+    intro = ('<p class="muted">The arguments the run was started with, as parsed (defaults included). Hover over an argument to see what it does.</p>'
+             if d is not None else "")
+    return '<section id="arguments"><h2>Arguments</h2>' + intro + '<div class="argcols">' + "".join(cards) + "</div>" + details + "</section>"
 
 
 def _scan_table(an):
     sc = an.get("burn_scan")
     if sc is None or len(sc["step"]) == 0:
         return ""
-    head = ["steps removed", "% of run", "max R-hat", "min N/tau", "max |drift z|", "plateau median ln p"]
+    head = ["steps removed", "% of run", "min N/tau", "max |drift z|", "plateau median ln p"]
     out = ['<table><thead><tr>' + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
     for k in range(len(sc["step"])):
         out.append("<tr>" + _cell(f"{sc['step'][k]:,}") + _cell(f"{100 * sc['frac'][k]:.0f}%") +
-                   _cell(_fmt(sc["rhat"][k]), _status(sc["rhat"][k], 1.01, 1.05)) +
                    _cell(_fmt(sc["n_over_tau"][k]), _status(sc["n_over_tau"][k], 50, 20, True)) +
                    _cell(_fmt(sc["drift"][k]), _status(sc["drift"][k], 3, 5)) + _cell(_fmt(sc["plateau"][k])) + "</tr>")
     out.append("</tbody></table>")
@@ -2687,7 +2675,7 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
         f'({3 * bi_["med_sd"]:.2f}): {bi_["tol"]:.2f}.</li>'
         f'<li>The burn-in ends at the start of the first block after which every block median stays above plateau minus tolerance. Here: {found_txt}</li>'
         '<li>The estimate decides where walkers are judged (frozen, low ln p, offset) and where the purple dashed lines are drawn. '
-        'The plots below show R-hat, N/tau and drift as a function of the number of steps removed from the start.</li></ol>'
+        'The plots below show N/tau and drift as a function of the number of steps removed from the start.</li></ol>'
         '<p class="muted">Limits: the resolution is one block; it only looks at the ensemble-median ln p, so it cannot tell whether individual walkers have forgotten their start '
         'or whether every parameter has equilibrated. Treat it as a lower bound.</p></details>')
 
@@ -2708,21 +2696,25 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
 
     secs.append('<section id="burnin"><h2>Burn-in</h2>'
                 '<p class="muted">Top: the approach of ln p to its plateau on a log step axis; the purple dashed line is the estimated burn-in and the green band is the tolerance used to find it. '
-                'Bottom: three convergence statistics recomputed after removing the first part of the run. If a statistic keeps improving as more steps are removed, the chain has not forgotten its start.</p>'
+                'Bottom: two convergence statistics recomputed after removing the first part of the run. If a statistic keeps improving as more steps are removed, the chain has not forgotten its start.</p>'
                 + burn_explain
                 + _stat_guide_html()
-                + '<p class="muted" style="margin-top:8px">In the plots each statistic is the worst value over all parameters: the largest R-hat, the smallest N/tau, the largest |drift z|. '
+                + '<p class="muted" style="margin-top:8px">In the plots each statistic is the worst value over all parameters: the smallest N/tau, the largest |drift z|. '
                   'Green dashed line: the value that separates good from not good; red dotted line: the value beyond which it is a problem; green shading: the good region.</p>'
                 + _img(plot_burnin(run, an), "burn-in", dpi) + "<h3>Statistics versus steps removed</h3>" + _scan_table(an)
                 + '<p class="muted">The scan uses up to 3000 evenly spaced steps and 128 unflagged walkers for speed.</p></section>')
 
     phys_names = [nm for nm in run.names if nm in run.derived_names]
     if phys_names:
-        hist_names = ["ln_posterior"] + phys_names
+        time_names = [nm for nm, raw in zip(run.col_names, run.raw_names) if raw == "geocenter_time"]      # the sampled time column
+        hist_names = ["ln_posterior"] + phys_names + time_names
         pi = run.physical_info
-        hist_intro = ("Physical parameters, converted from the sampled numbers (ln p is included as well). Prior bounds used for the conversion: "
+        hist_intro = ("Physical parameters, converted from the sampled numbers (ln p is included as well"
+                      + ("; the geocenter time is the sampled column itself, in seconds relative to the GPS time in its name" if time_names else "")
+                      + "). Prior bounds used for the conversion: "
                       f"total mass {pi['mtot_lim'][0]:g} to {pi['mtot_lim'][1]:g}, mass ratio {pi['q_lim'][0]:g} to {pi['q_lim'][1]:g}, "
                       f"distance {pi['dist_lim'][0]:g} to {pi['dist_lim'][1]:g} Mpc, spin magnitude {pi['chi_lim'][0]:g} to {pi['chi_lim'][1]:g}"
+                      + (f", eccentricity {pi['ecc_lim'][0]:g} to {pi['ecc_lim'][1]:g}" if pi.get("eccentric") else "")
                       + (" (the tdinf defaults; the h5 file does not store them, so if your run used other bounds pass "
                          "<code>physical=dict(mtot_lim=(...), q_lim=(...), dist_lim=(...), chi_lim=(...))</code>). " if pi["auto"] else ". "))
     else:
@@ -2771,7 +2763,7 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
     tr.append("</section>")
     secs.append("".join(tr))
 
-    secs.append('<section id="convergence"><h2>Convergence and autocorrelation</h2><p class="muted">N/tau above 50 is the primary criterion; R-hat across walkers is a supporting check because walkers of an ensemble sampler are not independent.</p>'
+    secs.append('<section id="convergence"><h2>Convergence and autocorrelation</h2><p class="muted">N/tau above 50 is the primary criterion.</p>'
                 + "<h3>Autocorrelation function</h3>" + _img(plot_acf(run, an), "autocorrelation function", dpi)
                 + "<h3>tau against chain length</h3><p class=\"muted\">tau must level off, and stay under the N/50 line.</p>" + _img(plot_autocorr(an), "autocorrelation time", dpi)
                 + "<h3>Per-parameter statistics</h3>" + _params_table(an)
@@ -2782,9 +2774,8 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
                 '<details open><summary>What is computed</summary><ul>'
                 '<li><b>Reading.</b> ' + ("" if run.stride == 1 else f"Only every {_ordinal(run.stride)} saved step was read; autocorrelation times are multiplied back by the stride. ") +
                 'Movement of walkers uses the last steps at full resolution.</li>'
-                '<li><b>Burn-in.</b> Estimated as the start of the first block after which the ensemble-median ln p stays within tolerance of its late-run plateau (explained in the Overview). Walker flags look at the part of the run after it. To remove the first steps before computing R-hat, N/tau and drift, pass <code>burn="auto"</code>, a fraction, or a number of steps.</li>'
+                '<li><b>Burn-in.</b> Estimated as the start of the first block after which the ensemble-median ln p stays within tolerance of its late-run plateau (explained in the Overview). Walker flags look at the part of the run after it. To remove the first steps before computing N/tau and drift, pass <code>burn="auto"</code>, a fraction, or a number of steps.</li>'
                 '<li><b>tau.</b> emcee-style integrated autocorrelation time: autocorrelation of each walker, averaged over walkers, integrated with Sokal\'s window (c = 5). ESS = walkers x N / tau. The sampled ln p is analysed like a parameter.</li>'
-                '<li><b>R-hat.</b> Rank-normalised split R-hat (bulk and folded tail), maximum of the two. The "clean" column excludes flagged walkers.</li>'
                 '<li><b>Drift.</b> Difference between the means of the two halves of the analysed chain, in standard errors computed with the ESS.</li>'
                 '<li><b>Walker flags.</b> The criteria are written out in plain language at the top of the Walkers section, with the numbers used in this run.</li>'
                 '<li><b>Mixing.</b> The spread of the walker medians of ln p divided by the typical spread within one walker. Walkers of a mixed ensemble share the same ln p levels, so this is small (below about 0.3).</li>'
@@ -2792,7 +2783,7 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
                 '<details><summary>Caveats</summary><ul>'
                 '<li>Sampled coordinates may include redundant dimensions (for example radial parts of Cartesian pairs). Their posterior is their prior; they are included in the tables.</li>'
                 '<li>A multimodal posterior can look converged if no walker ever visits the other mode. Check the log-probability distributions of the walkers.</li>'
-                '<li>The early part of the run, before the plateau, makes R-hat, drift and N/tau look worse; the Burn-in section shows by how much.</li>'
+                '<li>The early part of the run, before the plateau, makes drift and N/tau look worse; the Burn-in section shows by how much.</li>'
                 '</ul></details></section>')
 
     nav = "".join(f'<a href="#{i}">{t}</a>' for i, t in (("overview", "Overview"), ("arguments", "Arguments"), ("lnp", "Log-probability"), ("burnin", "Burn-in"),
@@ -2812,26 +2803,27 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
 # ============================================================================== run_sampler integration and command line
 
 _RS_BOUNDS = (("mtot_lim", "total_mass_prior_bounds"), ("q_lim", "mass_ratio_prior_bounds"),
-              ("dist_lim", "luminosity_distance_prior_bounds"), ("chi_lim", "spin_magnitude_prior_bounds"))
+              ("dist_lim", "luminosity_distance_prior_bounds"), ("chi_lim", "spin_magnitude_prior_bounds"),
+              ("ecc_lim", "eccentricity_prior_bounds"))
 _FIXED_ALIASES = {"right_ascension": ("right_ascension", "ra"), "declination": ("declination", "dec"),
                   "polarization": ("polarization", "psi"), "geocenter_time": ("geocenter_time", "geocent_time")}
 
 
-def infer_layout_from_file(path, vary_skypos, vary_time, group="mcmc"):
+def infer_layout_from_file(path, vary_skypos, vary_time, group="mcmc", eccentric=False):
     """
     Work out which columns an emcee file holds from the number of columns and the --vary-skypos / --vary-time flags.
     The spin model follows from the column count (precessing, aligned and spinless runs differ by 4 columns each).
     Returns (spin_model, names). Raises a clear error if the flags do not match the file.
     """
     import h5py
-    sky, tm = bool(vary_skypos), bool(vary_time)
+    sky, tm, ecc = bool(vary_skypos), bool(vary_time), bool(eccentric)
     with h5py.File(path, "r") as f:
         ndim = int(f[group]["chain"].shape[-1])
-    ok = [m for m in ("precessing", "aligned", "none") if len(get_layout(m, sky, tm)) == ndim]
+    ok = [m for m in ("precessing", "aligned", "none") if len(get_layout(m, sky, tm, ecc)) == ndim]
     if len(ok) != 1:
-        raise ValueError(f"{path} has {ndim} sampled columns, which does not match --vary-skypos={sky} --vary-time={tm}. "
+        raise ValueError(f"{path} has {ndim} sampled columns, which does not match --vary-skypos={sky} --vary-time={tm} --eccentric-analysis={ecc}. "
                          f"Run configurations with {ndim} columns: {candidate_layouts(ndim)}")
-    return ok[0], get_layout(ok[0], sky, tm)
+    return ok[0], get_layout(ok[0], sky, tm, ecc)
 
 
 def _fixed_from_json(path):
@@ -2861,8 +2853,9 @@ def report_from_args(args, kwargs=None, out_path=None, safe=True, burn=0, thin=1
     """
     Write the diagnostics report for a tdinf run from run_sampler.py's own `args` (and, optionally, its `kwargs` dict).
 
-    Uses args.output_h5 (the emcee backend), args.vary_skypos, args.vary_time and the four prior-bound arguments
-    (total_mass_prior_bounds, mass_ratio_prior_bounds, luminosity_distance_prior_bounds, spin_magnitude_prior_bounds).
+    Uses args.output_h5 (the emcee backend), args.vary_skypos, args.vary_time, args.eccentric_analysis and the prior-bound
+    arguments (total_mass_prior_bounds, mass_ratio_prior_bounds, luminosity_distance_prior_bounds, spin_magnitude_prior_bounds,
+    eccentricity_prior_bounds).
     The spin model is inferred from the number of columns. Right ascension, declination, polarization and geocenter time
     are only needed when they were not sampled; they are taken from `fixed`, then `kwargs`, then args.reference_parameters.
     The report goes to <output_h5 without .h5>_diagnostics.html unless out_path is given.
@@ -2876,14 +2869,15 @@ def report_from_args(args, kwargs=None, out_path=None, safe=True, burn=0, thin=1
     def _go():
         path = args.output_h5
         sky, tm = bool(getattr(args, "vary_skypos", False)), bool(getattr(args, "vary_time", False))
+        ecc = bool(getattr(args, "eccentric_analysis", False))
         if spin_model is None:
-            sm, names = infer_layout_from_file(path, sky, tm, group)
+            sm, names = infer_layout_from_file(path, sky, tm, group, ecc)
         else:
-            sm, names = spin_model, get_layout(spin_model, sky, tm)
+            sm, names = spin_model, get_layout(spin_model, sky, tm, ecc)
         run = read_emcee_h5(path, names=names, group=group, thin=thin, max_points=max_points, max_steps=max_steps or None)
         phys = physical
         if isinstance(physical, str) and physical == "args":
-            phys = dict(spin_model=sm, vary_skypos=sky, vary_time=tm)
+            phys = dict(spin_model=sm, vary_skypos=sky, vary_time=tm, eccentric=ecc)
             for key, attr in _RS_BOUNDS:
                 v = getattr(args, attr, None)
                 if v is not None:
@@ -2930,6 +2924,8 @@ def main(argv=None):
     p.add_argument("-o", "--output-h5", "--h5", dest="output_h5", default=None, help="the emcee backend file (as in run_sampler.py)")
     p.add_argument("--vary-time", action="store_true", help="as in run_sampler.py: time was sampled")
     p.add_argument("--vary-skypos", action="store_true", help="as in run_sampler.py: sky position was sampled")
+    p.add_argument("--eccentric-analysis", action="store_true", help="as in run_sampler.py: eccentricity and mean anomaly were sampled")
+    p.add_argument("--eccentricity-prior-bounds", "--ecc-lim", type=float, nargs=2, default=[0.0, 0.4])
     p.add_argument("--total-mass-prior-bounds", "--mtot-lim", type=float, nargs=2, default=[200, 350])
     p.add_argument("--mass-ratio-prior-bounds", "--q-lim", type=float, nargs=2, default=[0.17, 1])
     p.add_argument("--luminosity-distance-prior-bounds", "--dist-lim", type=float, nargs=2, default=[100, 10000])
@@ -2955,6 +2951,7 @@ def main(argv=None):
     if not a.output_h5:
         p.error("give the emcee backend with -o/--output-h5, as in run_sampler.py")
     args = argparse.Namespace(output_h5=a.output_h5, vary_time=a.vary_time, vary_skypos=a.vary_skypos,
+                              eccentric_analysis=a.eccentric_analysis, eccentricity_prior_bounds=a.eccentricity_prior_bounds,
                               total_mass_prior_bounds=a.total_mass_prior_bounds, mass_ratio_prior_bounds=a.mass_ratio_prior_bounds,
                               luminosity_distance_prior_bounds=a.luminosity_distance_prior_bounds,
                               spin_magnitude_prior_bounds=a.spin_magnitude_prior_bounds, reference_parameters=a.reference_parameters)
