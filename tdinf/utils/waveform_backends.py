@@ -83,12 +83,12 @@ class TEOBResumSBackend:
         """
         try:
             self.get_hphc(30., 30., [0, 0, 0.], [0, 0, 0.], delta_t=1 / 2048.,
-                          dist_mpc=100., f22_start=20., inclination=0., phi_ref=0.)
+                          dist_mpc=100., f22_start=20., inclination=0., phi_ref=0., eccentricity=0, mean_anomaly=0)
         except Exception as e:
             print('TEOBResumS warmup failed (continuing):', e)
 
     def get_hphc(self, m1_msun, m2_msun, chi1, chi2, delta_t, dist_mpc=1.,
-                 f22_start=20., f_ref=None, inclination=0., phi_ref=0., **unused):
+                 f22_start=20., f_ref=None, inclination=0., phi_ref=0., eccentricity=0, mean_anomaly=0,**unused):
         """
         Generate plus and cross polarizations at geocenter with TEOBResumS.
 
@@ -132,13 +132,13 @@ class TEOBResumSBackend:
                 'chi2x'              : chi2[0],
                 'chi2y'              : chi2[1],
                 'chi2z'              : chi2[2],
-                'ecc'                : 0,
+                'ecc'                : eccentricity,
                 'inclination'        : inclination,
                 'coalescence_angle'  : np.pi / 2 - phi_ref,
                 'srate_interp'       : 1./delta_t,
                 'initial_frequency'  : f22_start,
                 'distance'           : dist_mpc,
-                'anomaly'            : 0,
+                'anomaly'            : mean_anomaly,
                 'domain'             : 0,
                 'arg_out'            : "yes",
                 'interp_uniform_grid': "yes",
