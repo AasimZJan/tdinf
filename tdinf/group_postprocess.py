@@ -371,6 +371,9 @@ def get_settings_from_args(
         data_dict=data_dict,
         vary_time=args.vary_time,
         vary_skypos=args.vary_skypos,
+        use_lvk_mass_and_time_prior=args.use_lvk_mass_and_time_prior,
+        eccentric_analysis=args.eccentric_analysis,
+        aligned_spin_analysis=args.aligned_spin_analysis,
         f_max=args.fmax,
         only_prior=args.only_prior,
         **kwargs
