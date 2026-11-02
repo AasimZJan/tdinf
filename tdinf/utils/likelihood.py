@@ -139,15 +139,6 @@ class LogisticParameterManager:
         else:
             self.fixed['geocenter_time'] = self.reference_time
 
-        # print physical parameter names
-        lines = [
-            "Analysis physical parameters:",
-            f"  Logistic parameters: {', '.join(p.physical_name for p in self.logistic_parameters)}",
-            f"  Cartesian angles:    {', '.join(p.physical_name for p in self.cartesian_angles)}",
-        ]
-        if self.fixed:
-            lines.append(f"  Fixed:               {', '.join(self.fixed)}")
-        print("\n".join(lines))
 
         # generate list of ALL parameters we are sampling over
         self.sampled_keys = [p.logistic_name for p in self.logistic_parameters]
