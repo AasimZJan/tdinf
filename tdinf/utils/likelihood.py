@@ -5,7 +5,7 @@ import lal
 import lalsimulation as lalsim
 import sys
 from gwpy.timeseries import TimeSeries
-
+import os
 from . import detector_times_and_antenna_patterns as t_and_AP
 from .spins_and_masses import m1m2_from_mtotq
 from .misc import *
@@ -16,6 +16,12 @@ from .whiten import whitenData
 import astropy.units as u
 
 from .waveform_backends import is_external_approximant, make_backend
+
+try:
+    from bilby.core.prior import Prior as _BilbyPrior
+except ImportError:         # bilby is only needed by LnPriorManager.get_bilby_mcmc_prior_dict
+    _BilbyPrior = object
+from scipy.special import expit
 
 def check_spin_settings_of_approx(approx_name):
     """
@@ -248,6 +254,97 @@ class LogisticParameterManager:
         return param_dict
 
 
+class _LogisticCoordinatePrior(_BilbyPrior):
+    """
+    bilby prior of x = logit(u), u = (v - lower) / (upper - lower), for a physical parameter v whose density on [lower, upper] is
+    given by the subclass through the density of u on (0, 1). The density of x is p(u) u (1 - u) with u = expit(x).
+    """
+
+    def __init__(self, physical_minimum, physical_maximum, name=None, latex_label=None, unit=None, boundary=None):
+        super().__init__(name=name, latex_label=latex_label, unit=unit, minimum=-np.inf, maximum=np.inf, boundary=boundary)
+        self.physical_minimum = float(physical_minimum)
+        self.physical_maximum = float(physical_maximum)
+
+    def _ln_density_u(self, u):       # ln p(u) of the normalised density on (0, 1)
+        raise NotImplementedError
+
+    def _cdf_u(self, u):
+        raise NotImplementedError
+
+    def _inverse_cdf_u(self, f):
+        raise NotImplementedError
+
+    def ln_prob(self, val):
+        val = np.asarray(val, dtype=float)
+        ln_u_one_minus_u = -np.abs(val) - 2.0 * np.log1p(np.exp(-np.abs(val)))          # ln[u (1 - u)], u = expit(val)
+        return self._ln_density_u(expit(val)) + ln_u_one_minus_u
+
+    def prob(self, val):
+        return np.exp(self.ln_prob(val))
+
+    def cdf(self, val):
+        return self._cdf_u(expit(np.asarray(val, dtype=float)))
+
+    def rescale(self, val):
+        u = np.clip(self._inverse_cdf_u(np.asarray(val, dtype=float)), 1e-300, 1.0 - 1e-16)
+        return np.log(u) - np.log1p(-u)
+
+
+class LVKTotalMassCoordinate(_LogisticCoordinatePrior):
+    """x_total_mass with the LVK prior: the total mass M in [a, b] has density proportional to M."""
+
+    def _ln_density_u(self, u):
+        a, b = self.physical_minimum, self.physical_maximum
+        return np.log(a + (b - a) * u) - np.log(0.5 * (a + b))
+
+    def _cdf_u(self, u):
+        a, b = self.physical_minimum, self.physical_maximum
+        return u * (2.0 * a + (b - a) * u) / (a + b)
+
+    def _inverse_cdf_u(self, f):
+        a, b = self.physical_minimum, self.physical_maximum
+        return (-a + np.sqrt(a * a + (b - a) * (a + b) * f)) / (b - a)
+
+
+class LVKMassRatioCoordinate(_LogisticCoordinatePrior):
+    """x_mass_ratio with the LVK prior: the mass ratio q in [a, b] has density proportional to (1 + q)^-2."""
+
+    def _ln_density_u(self, u):
+        a, b = self.physical_minimum, self.physical_maximum
+        return np.log((1.0 + a) * (1.0 + b)) - 2.0 * np.log1p(a + (b - a) * u)
+
+    def _cdf_u(self, u):
+        a, b = self.physical_minimum, self.physical_maximum
+        q = a + (b - a) * u
+        return (1.0 + b) * (q - a) / ((b - a) * (1.0 + q))
+
+    def _inverse_cdf_u(self, f):
+        a, b = self.physical_minimum, self.physical_maximum
+        q = ((1.0 + b) * a + f * (b - a)) / ((1.0 + b) - f * (b - a))
+        return (q - a) / (b - a)
+
+
+class LVKMassRatioPrior(_BilbyPrior):
+    """The mass ratio q itself (physical coordinates) with the LVK prior: density proportional to (1 + q)^-2 on [minimum, maximum]."""
+
+    def __init__(self, minimum, maximum, name=None, latex_label=None, unit=None, boundary=None):
+        super().__init__(name=name, latex_label=latex_label, unit=unit, minimum=minimum, maximum=maximum, boundary=boundary)
+
+    def prob(self, val):
+        val = np.asarray(val, dtype=float)
+        a, b = self.minimum, self.maximum
+        return np.where((val >= a) & (val <= b), (1.0 + a) * (1.0 + b) / ((b - a) * (1.0 + val) ** 2), 0.0)
+
+    def cdf(self, val):
+        a, b = self.minimum, self.maximum
+        q = np.clip(np.asarray(val, dtype=float), a, b)
+        return (1.0 + b) * (q - a) / ((b - a) * (1.0 + q))
+
+    def rescale(self, val):
+        a, b = self.minimum, self.maximum
+        f = np.asarray(val, dtype=float)
+        return ((1.0 + b) * a + f * (b - a)) / ((1.0 + b) - f * (b - a))
+    
 class LnPriorManager(LogisticParameterManager):
 
     def initialize_walkers(self, nwalkers, injected_parameters, reference_posterior=None, verbose=False, use_lvk_mass_and_time_prior=False):
@@ -419,6 +516,103 @@ class LnPriorManager(LogisticParameterManager):
                 lnprior += -0.5 * (x_dict['c2_x'] ** 2 + x_dict['c2_y'] ** 2 + x_dict['c2_z'] ** 2)
 
         return lnprior
+
+
+    def get_bilby_mcmc_prior_dict(self, use_lvk_mass_and_time_prior=False, use_physical_coordinates_for_sampling=False):
+        '''
+        The prior of the analysis as a bilby `PriorDict`, to be passed to bilby_mcmc. Only the SAMPLED parameters get a prior.
+        `use_lvk_mass_and_time_prior` must be the value that is passed to get_lnprior. Needs bilby.
+
+        use_physical_coordinates_for_sampling=False (default): the sampling coordinates of this manager, one prior per sampled
+        key, equal to get_lnprior up to a constant (tdinf drops normalisations, bilby's priors are normalised):
+          logistic coordinates                      -> Logistic(0, 1)
+          total mass / mass ratio, LVK flag         -> LVKTotalMassCoordinate / LVKMassRatioCoordinate (the extra factor M / (1 + q)**2)
+          both components of each Cartesian angle,
+          and the spin-direction numbers c          -> Gaussian(0, 1)
+
+        use_physical_coordinates_for_sampling=True: the physical parameters themselves, with the same distributions, built from the
+        limits and names of logistic_parameters and cartesian_angles:
+          limits [a, b] of a logistic parameter     -> Uniform(a, b)   (LVK flag: total mass PowerLaw(1), mass ratio LVKMassRatioPrior)
+          inclination (cos) / declination (sin)     -> Sine(0, pi) / Cosine(-pi/2, pi/2), flat in the cosine / sine
+          Cartesian angles                          -> Uniform over one period around phase_offset, boundary='periodic'
+          spins, precessing: spin{1,2}_magnitude as above, plus spin{1,2}_tilt -> Sine(0, pi) and spin{1,2}_azimuth -> Uniform(0, 2 pi),
+                             the polar and azimuthal angles of the spin in the frame of spin{1,2}_x, _y, _z, so that
+                             spin_x = a sin(tilt) cos(azimuth), spin_y = a sin(tilt) sin(azimuth), spin_z = a cos(tilt)
+                             (uniform magnitude, isotropic direction, as in the sampling-coordinate prior)
+          spins, aligned: spin{1,2}_z -> Uniform(-chi_max, chi_max) (they replace the magnitudes; needs chi_lim[0] = 0)
+        In both cases geocenter_time (if sampled) is Gaussian(reference time, sigma_time), or with the LVK flag
+        Uniform(reference time +- 0.075 s).
+        '''
+        from bilby.core.prior import PriorDict, Logistic, Gaussian, Uniform, Sine, Cosine, PowerLaw
+
+        priors = PriorDict()
+        lvk = use_lvk_mass_and_time_prior
+
+        def time_prior(key):
+            if lvk:
+                return Uniform(minimum=self.reference_time - 0.075, maximum=self.reference_time + 0.075, name=key)
+            return Gaussian(mu=self.reference_time, sigma=self.sigma_time, name=key)
+
+        if not use_physical_coordinates_for_sampling:
+            # ---- the sampling coordinates: logistic parameters, Cartesian angles, spin-direction numbers
+            logistic = {p.logistic_name: p for p in self.logistic_parameters}
+            cartesian = {name for angle in self.cartesian_angles for name in (angle.x_name, angle.y_name)}
+            for key in self.sampled_keys:
+                if key in logistic:
+                    lower, upper = logistic[key].limit
+                    if lvk and logistic[key].physical_name == 'total_mass':
+                        priors[key] = LVKTotalMassCoordinate(lower, upper, name=key)
+                    elif lvk and logistic[key].physical_name == 'mass_ratio':
+                        priors[key] = LVKMassRatioCoordinate(lower, upper, name=key)
+                    else:
+                        priors[key] = Logistic(mu=0.0, scale=1.0, name=key)
+                elif key == 'geocenter_time':
+                    priors[key] = time_prior(key)
+                elif key in cartesian or key.startswith(('c1_', 'c2_')):
+                    priors[key] = Gaussian(mu=0.0, sigma=1.0, name=key)
+                else:
+                    raise ValueError(f"no bilby prior is defined for the sampled parameter '{key}': add it to get_bilby_mcmc_prior_dict")
+            return priors
+
+        # ---- the physical parameters
+        aligned = self.aligned_spins and not self.no_spins
+        chi_limit = None
+        for parameter in self.logistic_parameters:
+            name = parameter.physical_name
+            lower, upper = parameter.limit
+            if isinstance(parameter, TrigLogisticParameter):
+                if parameter.trig_function is np.cos:           # flat in cos(angle): inclination
+                    priors[name] = Sine(minimum=0.0, maximum=np.pi, name=name)
+                else:                                           # flat in sin(angle): declination
+                    priors[name] = Cosine(minimum=-np.pi / 2, maximum=np.pi / 2, name=name)
+            elif name in ('spin1_magnitude', 'spin2_magnitude'):
+                chi_limit = (lower, upper)
+                if not aligned:
+                    priors[name] = Uniform(minimum=lower, maximum=upper, name=name)
+            elif lvk and name == 'total_mass':
+                priors[name] = PowerLaw(alpha=1, minimum=lower, maximum=upper, name=name)
+            elif lvk and name == 'mass_ratio':
+                priors[name] = LVKMassRatioPrior(lower, upper, name=name)
+            else:
+                priors[name] = Uniform(minimum=lower, maximum=upper, name=name)
+
+        for angle in self.cartesian_angles:
+            priors[angle.physical_name] = Uniform(minimum=angle.phase_offset - np.pi, maximum=angle.phase_offset + np.pi,
+                                                  name=angle.physical_name, boundary='periodic')
+
+        if not self.no_spins:
+            for i in ('1', '2'):
+                if aligned:
+                    if chi_limit[0] != 0:
+                        raise ValueError(f"aligned spins in physical coordinates need the spin magnitude limit to start at 0, not {chi_limit}")
+                    priors[f'spin{i}_z'] = Uniform(minimum=-chi_limit[1], maximum=chi_limit[1], name=f'spin{i}_z')
+                else:
+                    priors[f'spin{i}_tilt'] = Sine(minimum=0.0, maximum=np.pi, name=f'spin{i}_tilt')
+                    priors[f'spin{i}_azimuth'] = Uniform(minimum=0.0, maximum=2 * np.pi, name=f'spin{i}_azimuth', boundary='periodic')
+
+        if self.vary_time:
+            priors['geocenter_time'] = time_prior('geocenter_time')
+        return priors
 
 
 class AntennaAndTimeManager(LogisticParameterManager):
@@ -950,3 +1144,158 @@ class LnLikelihoodManager(LogisticParameterManager):
             **{f'{ifo}_matched_filter_SNR':per_detector_mf_snrs[i] for i,ifo in enumerate(self.ifos)}
         }
         return SNRs_dict
+
+try:
+    from bilby import Likelihood as _BilbyLikelihood
+except ImportError:         # bilby is only needed by TdinfBilbyLikelihood
+    _BilbyLikelihood = object
+
+
+class TdinfBilbyLikelihood(_BilbyLikelihood):
+    """
+    tdinf's log LIKELIHOOD for bilby (the prior is the PriorDict from LnPriorManager.get_bilby_mcmc_prior_dict). It calls the
+    likelihood manager's get_log_likelihood with the physical dictionary, which it builds from the parameters bilby hands over:
+
+      use_physical_coordinates_for_sampling=False: the parameters are the sampling coordinates (the manager's sampled_keys); the
+          dictionary is lm.samp_to_phys(x), as in the emcee code.
+      use_physical_coordinates_for_sampling=True: the parameters are the physical ones (parameter_keys = the keys of the prior
+          dict); the dictionary is the manager's fixed parameters plus those parameters, with spin{1,2}_x, _y, _z made by the manager's
+          get_physical_spins from magnitude, tilt and azimuth (precessing), from spin{1,2}_z (aligned) or zero (no spins).
+
+    Anything that is not finite (a failed waveform, NaN) is -inf; with only_prior the likelihood is 0.
+
+    The two conversion methods are only needed in physical coordinates: physical_parameters_from_sampling (a starting point in
+    sampling coordinates -> the physical parameters bilby samples, for initial_sample_dict) and sampling_from_physical_parameters
+    (bilby's samples -> sampling coordinates, for the usual post-processing and ln prior).
+
+    npool: bilby pickles this object into every worker process, so it holds only plain, picklable state and is defined at module
+    level. limit_threads=True (set it when npool > 1) limits BLAS / OpenMP to one thread in every process that evaluates it, so that
+    the workers do not oversubscribe the cores; this is decided per process (by pid), so an object that was already used in the
+    parent before being pickled still limits the threads in each worker.
+    """
+
+    _SPIN_ANGLE_KEYS = ('spin1_tilt', 'spin1_azimuth', 'spin2_tilt', 'spin2_azimuth', 'spin1_z', 'spin2_z')
+
+    def __init__(self, likelihood_manager, parameter_keys=None, use_physical_coordinates_for_sampling=False, limit_threads=False):
+        self.lm = likelihood_manager
+        self.use_physical = bool(use_physical_coordinates_for_sampling)
+        self.limit_threads = bool(limit_threads)
+        self._limited_in_pid = None
+        if self.use_physical:
+            if parameter_keys is None:
+                raise ValueError("physical coordinates need parameter_keys: pass list(prior_dict), the keys of the prior dict")
+            self.keys = list(parameter_keys)
+            self._copied_keys = [key for key in self.keys if key not in self._SPIN_ANGLE_KEYS]
+        else:
+            self.keys = list(likelihood_manager.sampled_keys)
+        if _BilbyLikelihood is not object:
+            super().__init__(parameters={key: None for key in self.keys})
+
+    # ---------------------------------------------------------------------------------------------- the likelihood
+    def _limit_threads_once(self):
+        if self.limit_threads and self._limited_in_pid != os.getpid():
+            try:
+                from threadpoolctl import threadpool_limits
+                threadpool_limits(limits=1)
+            except ImportError:
+                pass
+            self._limited_in_pid = os.getpid()
+
+    def _physical_dict(self):
+        lm, p = self.lm, self.parameters
+        physical = dict(lm.fixed)                       # eccentricity, mean_anomaly, sky position, time when they are not sampled
+        for key in self._copied_keys:
+            physical[key] = float(p[key])
+        for i in ('1', '2'):
+            if lm.no_spins:
+                magnitude, direction = 0.0, (0.0, 0.0, 1.0)
+            elif lm.aligned_spins:
+                z = float(p[f'spin{i}_z'])
+                magnitude, direction = abs(z), (0.0, 0.0, 1.0 if z >= 0 else -1.0)
+                physical[f'spin{i}_magnitude'] = magnitude
+            else:
+                magnitude, tilt, azimuth = float(p[f'spin{i}_magnitude']), float(p[f'spin{i}_tilt']), float(p[f'spin{i}_azimuth'])
+                direction = (np.sin(tilt) * np.cos(azimuth), np.sin(tilt) * np.sin(azimuth), np.cos(tilt))
+            # the manager's own function: magnitude * c / |c| (zeros if the waveform has no spins)
+            physical[f'spin{i}_x'], physical[f'spin{i}_y'], physical[f'spin{i}_z'] = lm.get_physical_spins(magnitude, *direction)
+        return physical
+
+    def log_likelihood(self):
+        if self.lm.only_prior:
+            return 0.0
+        self._limit_threads_once()
+        if self.use_physical:
+            x_phys = self._physical_dict()
+        else:
+            x_phys = self.lm.samp_to_phys(np.array([self.parameters[key] for key in self.keys], dtype=float))
+        value = self.lm.get_log_likelihood(x_phys)
+        return float(value) if np.isfinite(value) else -np.inf
+
+    # ---------------------------------------------------------------------------------------------- conversions (physical coordinates)
+    def physical_parameters_from_sampling(self, x):
+        """
+        The physical parameters bilby samples in physical coordinates (the keys of get_bilby_mcmc_prior_dict(...,
+        use_physical_coordinates_for_sampling=True)) for a point `x` in sampling coordinates. Use it to turn a starting point into
+        an initial_sample_dict.
+        """
+        lm = self.lm
+        phys = lm.samp_to_phys(np.asarray(x, dtype=float))
+        out = {}
+        for parameter in lm.logistic_parameters:
+            if lm.aligned_spins and parameter.physical_name in ('spin1_magnitude', 'spin2_magnitude'):
+                continue                                    # aligned spins are sampled through spin1_z, spin2_z
+            out[parameter.physical_name] = float(phys[parameter.physical_name])
+        for angle in lm.cartesian_angles:
+            out[angle.physical_name] = float(phys[angle.physical_name])
+        if not lm.no_spins:
+            for i in ('1', '2'):
+                sx, sy, sz = phys[f'spin{i}_x'], phys[f'spin{i}_y'], phys[f'spin{i}_z']
+                if lm.aligned_spins:
+                    out[f'spin{i}_z'] = float(sz)
+                else:
+                    magnitude = np.sqrt(sx ** 2 + sy ** 2 + sz ** 2)
+                    out[f'spin{i}_tilt'] = float(np.arccos(np.clip(sz / magnitude, -1.0, 1.0))) if magnitude > 0 else np.pi / 2
+                    out[f'spin{i}_azimuth'] = float(np.arctan2(sy, sx) % (2 * np.pi))
+        if lm.vary_time:
+            out['geocenter_time'] = float(phys['geocenter_time'])
+        return out
+
+    def sampling_from_physical_parameters(self, table, rng=None):
+        """
+        Samples in SAMPLING coordinates, shape (n, ndim) in the order of sampled_keys, from a table (DataFrame or dict of columns) of
+        the physical parameters that bilby sampled in physical coordinates. Needed for the usual post-processing and ln prior.
+
+        The sampling coordinates contain redundant radial coordinates (the length of each Cartesian pair and of each spin-direction
+        vector) that the physical parameters do not have. They are independent of the data, so they are drawn from their priors
+        (Rayleigh for a pair, chi with 3 degrees of freedom for a vector, half-normal for an aligned spin): the result is then a
+        genuine sample of the sampling-coordinate posterior, and samp_to_phys gives back exactly the physical parameters.
+        """
+        lm = self.lm
+        rng = np.random.default_rng() if rng is None else rng
+        column = {key: i for i, key in enumerate(lm.sampled_keys)}
+        get = lambda name: np.asarray(table[name], dtype=float)
+        n = len(get('geocenter_time' if lm.vary_time else lm.cartesian_angles[0].physical_name))
+        x = np.empty((n, lm.num_parameters))
+        for parameter in lm.logistic_parameters:
+            name = parameter.physical_name
+            values = np.abs(get(name.replace('_magnitude', '_z'))) if (lm.aligned_spins and name in ('spin1_magnitude', 'spin2_magnitude')) else get(name)
+            x[:, column[parameter.logistic_name]] = parameter.physical_to_logistic(values)
+        for angle in lm.cartesian_angles:
+            # radian_to_cartesian ignores phase_offset (cartesian_to_radian adds it), so it is given the angle minus the offset
+            direction_x, direction_y = angle.radian_to_cartesian(get(angle.physical_name) - angle.phase_offset)
+            radius = np.sqrt(-2.0 * np.log(1.0 - rng.random(n)))              # Rayleigh(1): the length of a 2-D standard normal
+            x[:, column[angle.x_name]] = radius * direction_x
+            x[:, column[angle.y_name]] = radius * direction_y
+        if not lm.no_spins:
+            for i in ('1', '2'):
+                if lm.aligned_spins:
+                    x[:, column[f'c{i}_z']] = np.sign(get(f'spin{i}_z')) * np.abs(rng.standard_normal(n))
+                else:
+                    tilt, azimuth = get(f'spin{i}_tilt'), get(f'spin{i}_azimuth')
+                    radius = np.linalg.norm(rng.standard_normal((n, 3)), axis=1)    # chi with 3 degrees of freedom
+                    x[:, column[f'c{i}_x']] = radius * np.sin(tilt) * np.cos(azimuth)
+                    x[:, column[f'c{i}_y']] = radius * np.sin(tilt) * np.sin(azimuth)
+                    x[:, column[f'c{i}_z']] = radius * np.cos(tilt)
+        if lm.vary_time:
+            x[:, column['geocenter_time']] = get('geocenter_time')
+        return x
