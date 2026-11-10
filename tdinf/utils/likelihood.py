@@ -543,15 +543,18 @@ class LnPriorManager(LogisticParameterManager):
         In both cases geocenter_time (if sampled) is Gaussian(reference time, sigma_time), or with the LVK flag
         Uniform(reference time +- 0.075 s).
         '''
-        from bilby.core.prior import PriorDict, Logistic, Gaussian, Uniform, Sine, Cosine, PowerLaw
+        from bilby.core.prior import PriorDict, Logistic, Gaussian, TruncatedGaussian, Uniform, Sine, Cosine, PowerLaw
 
         priors = PriorDict()
         lvk = use_lvk_mass_and_time_prior
 
         def time_prior(key):
             if lvk:
-                return Uniform(minimum=self.reference_time - 0.075, maximum=self.reference_time + 0.075, name=key)
-            return Gaussian(mu=self.reference_time, sigma=self.sigma_time, name=key)
+                return Uniform(minimum=self.reference_time - 0.075, maximum=self.reference_time + 0.075, name=key, boundary='reflective')
+            # A Gaussian cut at +-5 sigma (the cut removes 6e-7 of the prior). bilby's proposals scale their steps by the prior WIDTH and treat an infinite width as 1 (second), so with an
+            # uncut Gaussian the millisecond-wide time posterior sets the step size of the adaptive Gaussian proposal for every parameter; a finite width puts time on the same footing.
+            return TruncatedGaussian(mu=self.reference_time, sigma=self.sigma_time, minimum=self.reference_time - 5 * self.sigma_time,
+                                     maximum=self.reference_time + 5 * self.sigma_time, name=key, boundary='reflective')
 
         if not use_physical_coordinates_for_sampling:
             # ---- the sampling coordinates: logistic parameters, Cartesian angles, spin-direction numbers
@@ -599,6 +602,9 @@ class LnPriorManager(LogisticParameterManager):
         for angle in self.cartesian_angles:
             priors[angle.physical_name] = Uniform(minimum=angle.phase_offset - np.pi, maximum=angle.phase_offset + np.pi,
                                                   name=angle.physical_name, boundary='periodic')
+            if angle.physical_name=="polarization":
+                priors[angle.physical_name] = Uniform(minimum=angle.phase_offset, maximum=angle.phase_offset + np.pi,
+                                                                  name=angle.physical_name, boundary='periodic')
 
         if not self.no_spins:
             for i in ('1', '2'):
@@ -612,6 +618,14 @@ class LnPriorManager(LogisticParameterManager):
 
         if self.vary_time:
             priors['geocenter_time'] = time_prior('geocenter_time')
+        # Bounded priors: a proposal that leaves the support is reflected back inside instead of being rejected by the prior (a symmetric move, so detailed balance holds).
+        # About half of the differential-evolution jumps of a cold chain otherwise land outside the spin, mass-ratio and tilt bounds and are wasted.
+        # The mass ratio is left out: its upper wall (q = 1) is only the convention m1 >= m2, and the physical fold across it is q -> 1/q with the two spins exchanged, not q -> 2 - q.
+        for key, prior in priors.items():
+            if key == 'mass_ratio':
+                continue
+            if prior.boundary is None and np.isfinite(prior.minimum) and np.isfinite(prior.maximum):
+                prior.boundary = 'reflective'
         return priors
 
 
