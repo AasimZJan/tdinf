@@ -3,7 +3,6 @@
 
 import argparse
 import numpy as np
-import emcee
 import json
 import pandas as pd
 from multiprocessing import Pool, cpu_count
@@ -647,6 +646,74 @@ def save_posterior(samples, ln_posterior, likelihood_manager, output, **kwargs):
     print("File saved: %r" % sample_path)
     return df
 
+def make_bilby_swaps_continue():
+    """
+    Make the temperature swaps of bilby_mcmc carry the exchanged state forward.
+
+    In the bilby_mcmc code this was checked against, an accepted swap does `chain[-1] = other_state`, which rewrites only the STORED last row of the two chains.
+    Each chain goes on stepping from `chain.current_sample`, which is not updated, so the exchanged states never become the chains' states: the hot chains do not
+    feed the cold chains, and the recorded cold-chain rows at the swap iterations are copies from the neighbouring temperature (the pickled chains of a real run showed
+    this directly: after 41-47% of the swap iterations the cold chain continued from its own old state, matching the swap acceptance).
+    This wraps `swap_tempered_chains`: bilby's own swap runs first, then every chain continues from the state stored in its last row. For a chain that did not swap, that
+    row equals its current sample, so nothing changes; for a bilby that already continues from the swapped state it is a no-op. Only the main process is affected (the
+    swaps are done there; the workers only step the chains). Returns True if the wrapper was installed now, False if it already was, None if bilby's class is not available.
+    """
+    try:
+        from bilby.bilby_mcmc.sampler import BilbyPTMCMCSampler
+    except ImportError:
+        return None
+    bilby_swap = BilbyPTMCMCSampler.swap_tempered_chains
+    if getattr(bilby_swap, '_tdinf_continues', False):
+        return False
+
+    def swap_and_continue(self):
+        bilby_swap(self)
+        for samplers in self.sampler_dictionary.values():
+            for sampler in samplers:
+                sampler.chain.current_sample = sampler.chain[-1]
+
+    swap_and_continue._tdinf_continues = True
+    BilbyPTMCMCSampler.swap_tempered_chains = swap_and_continue
+    return True
+
+def make_bilby_chains_ship_light(headroom=1000):
+    """
+    Send each bilby_mcmc chain to the worker processes without its unused empty rows.
+
+    With a pool, bilby pickles every sampler, chain included, to a worker and back at EVERY iteration. A chain stores its samples in an array that is allocated in blocks of
+    100000 rows, so all of it is sent although only the first `position + 1` rows are filled (a checkpoint of a 16-chain run is 220 MB at 34000 rows). This gives `Chain` a
+    __getstate__ that keeps only the filled rows and a __setstate__ that restores `headroom` empty rows (and extends by that much when they run out), so the amount sent is
+    that of the samples actually stored. The chain itself is unchanged, and older checkpoints load as before. It has to be installed before the pool is created, so that the
+    workers have it too, which holds for the default 'fork' start method; with 'spawn' only the trip to the workers is lighter.
+    Returns True if installed now, False if it already was, None if bilby's class is not available.
+    """
+    try:
+        from bilby.bilby_mcmc.chain import Chain
+    except ImportError:
+        return None
+    if getattr(Chain, '_tdinf_light', False):
+        return False
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        filled = self.position + 1
+        state['_chain_array'] = self._chain_array[:filled]
+        state['_chain_array_length'] = filled
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        filled = self.position + 1
+        columns = self._chain_array.shape[1]
+        self._chain_array = np.concatenate((self._chain_array[:filled], np.zeros((headroom, columns))), axis=0)
+        self._chain_array_length = len(self._chain_array)
+        self.block_length = headroom
+
+    Chain.__getstate__ = __getstate__
+    Chain.__setstate__ = __setstate__
+    Chain._tdinf_light = True
+    return True
+
 def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_parameters, ref_pe_samples):
     """
     Run bilby_mcmc. 
@@ -713,6 +780,9 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
         # --- printing and checkpoints
         printdt=1800,                       # (60) seconds between progress prints AND between convergence checks
         check_point_delta_t=1800,        # (1800) seconds between checkpoints
+        # tdinf arguments for bilby_mcmc
+        tdinf_fix_swaps=True,
+        tdinf_light_chains=True,
     )
 
     # Apply user-specified sampler kwargs
@@ -721,7 +791,16 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
             CONSTRUCTOR[key] = value
         elif key in SAMPLER:
             SAMPLER[key] = value
-    
+    # the swaps between temperatures must carry the exchanged state forward (see make_bilby_swaps_continue); "tdinf_fix_swaps": false switches this off
+    if SAMPLER['ntemps'] > 1 and SAMPLER.get('tdinf_fix_swaps', True):
+        installed = make_bilby_swaps_continue()
+        print({True: "tempered chains: temperature swaps now carry the exchanged state forward", False: "tempered chains: swap wrapper already installed", None: "WARNING: could not install the swap wrapper (bilby's BilbyPTMCMCSampler not found)"}[installed])
+
+    # with a pool, send the chains to the workers without their unused empty rows (see make_bilby_chains_ship_light); "tdinf_light_chains": false switches this off
+    if CONSTRUCTOR['npool'] > 1 and SAMPLER.get('tdinf_light_chains', True):
+        installed = make_bilby_chains_ship_light()
+        print({True: "pool: chains are now sent to the workers without their unused empty rows", False: "pool: light-chain wrapper already installed", None: "WARNING: could not install the light-chain wrapper (bilby's Chain not found)"}[installed])
+
     print('Constructor arguments:', CONSTRUCTOR)
     print('Sampler arguments:', SAMPLER)
 
@@ -732,14 +811,14 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
 
     # the starting point, from the posterior if the user gave one (--initial-walkers or a reference posterior); otherwise bilby draws
     # it from the prior. bilby_mcmc takes a single initial_sample_dict, so the first of the starting points is used.
-    if SAMPLER['initial_sample_dict'] is None:
-        starts = get_bilby_initial_samples(likelihood_manager, args, SAMPLER, reference_parameters, ref_pe_samples, likelihood=likelihood)
-        if starts is not None:
-            SAMPLER['initial_sample_dict'] = starts[0]
-            if len(starts) > 1:
-                print(f"NOTE: {len(starts)} chains but bilby_mcmc takes a single initial_sample_dict: the first starting point is used.")
-        else:
-            print("No posterior to start from: bilby draws the starting point from the prior.")
+    # if SAMPLER['initial_sample_dict'] is None:
+    #     starts = get_bilby_initial_samples(likelihood_manager, args, SAMPLER, reference_parameters, ref_pe_samples, likelihood=likelihood)
+    #     if starts is not None:
+    #         SAMPLER['initial_sample_dict'] = starts[0]
+    #         if len(starts) > 1:
+    #             print(f"NOTE: {len(starts)} chains but bilby_mcmc takes a single initial_sample_dict: the first starting point is used.")
+    #     else:
+    #         print("No posterior to start from: bilby draws the starting point from the prior.")
 
     print(f"\nbilby_mcmc {bilby.__version__}: {len(prior_dict)} parameters in {'physical' if physical else 'sampling'} coordinates, "
           f"{bilby_number_of_chains(SAMPLER)} chains, outdir={outdir}, label={label}")
@@ -871,6 +950,11 @@ def emcee_burn_in_and_thin(sampler):
 
 def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parameters, ref_pe_samples):
     """Run emcee; similar to the version tdinf used it before."""
+    try:
+        import emcee
+    except ImportError as error:
+        raise ImportError("--sampler emcee needs emcee (pip install emcee)") from error
+            
     settings = dict(nwalkers=args.nwalkers, nsteps=args.nsteps, ncpu=args.ncpu, check_interval=500, tau_multiple=100, tau_tolerance=0.01,
                     progress=True, moves=None, produce_diagnostics=bool(args.produce_diagnostics))
     # unknown = sorted(set(sampler_kwargs) - set(settings))
