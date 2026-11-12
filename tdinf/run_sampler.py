@@ -8,7 +8,14 @@ import pandas as pd
 from multiprocessing import Pool, cpu_count
 from contextlib import closing
 import os
+
+try:
+    import emcee
+except ImportError:          
+    emcee = None
+
 import tdinf.utils as utils
+from tdinf.utils import sampler_utils
 
     
 def create_run_sampler_arg_parser():
@@ -137,7 +144,7 @@ def create_run_sampler_arg_parser():
                    help="Standard deviation of time prior [s.]"
                         "Default: 0.01 s")
     p.add_argument('--use-lvk-mass-and-time-prior', default=False, action='store_true',
-                   help="Use uniform in det frame mass and time prior.")
+                   help="Use uniform in detector frame mass and time prior.")
     p.add_argument('--eccentricity-prior-bounds', type=float, nargs=2, default=[0.0, 0.4],
                    help="eccentricity bounds for eccentricity prior."
                         "Default: [0.0, 0.4]")
@@ -730,21 +737,21 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
     label = os.path.splitext(os.path.basename(args.output))[0]
     os.makedirs(outdir, exist_ok=True)
 
-    # Arguments of the Bilby_MCMC constructor (the defaults are in brackets):
+    # Arguments of the Bilby_MCMC constructor
     CONSTRUCTOR = dict(
         outdir=outdir,                   # where checkpoint files and outputs go
         label=label,                     # prefix of the output files
         use_ratio=False,                 # True if log_likelihood() returns a log likelihood RATIO
         skip_import_verification=True,   # (True)
         check_point_plot=False,          # (True) make progress plots at every checkpoint; slow, so off here
-        diagnostic=True,                # (False) extra deep-diagnostic plots for convergence problems
-        resume=bool(args.resume),                    # (True) resume from checkpoint files found in outdir
+        diagnostic=True,                 # (False) extra deep-diagnostic plots for convergence problems
+        resume=bool(args.resume),        # (True) resume from checkpoint files found in outdir
         exit_code=130,                   # (130) exit code used when the run is interrupted
         verbose=True,                    # (True) print progress
-        npool=1,                         # processes sharing the chains (ntemps x nensemble); choose a divisor of the number of chains
+        npool=1,                         # processes sharing the chains; choose a divisor of the number of chains
     )
 
-    # Sampler arguments (this is Bilby_MCMC.default_kwargs; the default is in brackets, and the docstring printed above has the details):
+    # Sampler arguments (this is Bilby_MCMC.default_kwargs
     SAMPLER = dict(
         # --- how many samples, burn-in and thinning
         nsamples=1000,                   # (1000) number of samples to draw
@@ -771,7 +778,7 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
         tau_window=None,                 # (None) window used for the ACT estimate (see docstring)
         stop_after_convergence=False,    # (False) with tempering: stop updating the chains once they have converged
         # --- proposals
-        proposal_cycle="default",        # ("default") built-in cycle, "gwA" for gravitational-wave problems, or a ProposalCycle object
+        proposal_cycle="default",        # ("default") built-in cycle, or a ProposalCycle object
         # --- evidence (only meaningful with ntemps > 1)
         evidence_method="stepping_stone",  # ("stepping_stone") see docstring for the alternatives
         # --- the starting point
@@ -807,6 +814,18 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
 
     physical = bool(args.use_physical_coordinates_for_sampling)                              
     prior_dict = likelihood_manager.log_prior.get_bilby_mcmc_prior_dict(use_lvk_mass_and_time_prior=args.use_lvk_mass_and_time_prior,use_physical_coordinates_for_sampling=physical)
+    
+    # the proposal cycle "tdinf_gw" ("tdinf_gw_noFM", ...)
+    if str(SAMPLER['proposal_cycle']).startswith('tdinf_gw'):
+        try:
+            from tdinf.utils import sampler_utils
+        except ImportError as error:
+            raise RuntimeError('proposal_cycle "tdinf_gw" needs tdinf/utils/sampler_utils.py and a bilby with bilby_mcmc') from error
+        prior_dict = sampler_utils.TdinfPriorDictForGWProposal(prior_dict)
+        sampler_utils.register_tdinf_gw_cycle()
+        print(f"proposal cycle {SAMPLER['proposal_cycle']} installed: bilby's gwA for tdinf's parameters; parameters per group "
+              f"{ {g: len(getattr(prior_dict, g)) for g in ('intrinsic', 'extrinsic', 'mass', 'spin', 'measured_spin', 'sky')} }")
+    
     likelihood = utils.TdinfBilbyLikelihood(likelihood_manager, parameter_keys=list(prior_dict),
                                             use_physical_coordinates_for_sampling=physical, limit_threads=CONSTRUCTOR['npool'] > 1)
 
@@ -915,39 +934,7 @@ class _ChunkOnePool:
 
     def map(self, func, iterable):
         return self.pool.map(func, iterable, chunksize=1)
-    
-def emcee_moves(spec):
-    """
-    The `moves` argument of emcee.EnsembleSampler from the "moves" setting: None or "stretch" is emcee's default (the stretch move, as in the old
-    script); "de" is differential evolution with a few snooker moves (emcee's recommendation, 0.8 / 0.2); or a list of [name, weight] pairs with names
-    from stretch, de, snooker, walk.
-    """
-    if spec is None or spec == 'stretch':
-        return None
-    if spec == 'de':
-        return [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
-    if isinstance(spec, (list, tuple)):
-        moves = []
-        for name, weight in spec:
-            if name not in EMCEE_MOVES:
-                raise ValueError(f"unknown emcee move '{name}'; use one of {sorted(EMCEE_MOVES)}")
-            moves.append((getattr(emcee.moves, EMCEE_MOVES[name])(), float(weight)))
-        return moves
-    raise ValueError(f"the emcee setting 'moves' must be null, 'stretch', 'de' or a list of [name, weight] pairs, not {spec!r}")
 
-
-def emcee_burn_in_and_thin(sampler):
-    """The burn-in and thinning the old script used (utils.postprocess_samples): 5 x the largest and 0.5 x the smallest autocorrelation time."""
-    tau = sampler.get_autocorr_time(quiet=True)
-    try:
-        burnin = max(int(5 * np.max(tau)), 0)
-        thin = max(int(0.5 * np.min(tau)), 1)
-        print(f'burnin = {burnin}, thin = {thin}')
-    except Exception:
-        print('WARNING thinning by 1, 0 burnin!')
-        burnin = 0
-        thin = 1
-    return burnin, thin
 
 def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parameters, ref_pe_samples):
     """Run emcee; similar to the version tdinf used it before."""
@@ -971,7 +958,7 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
     nwalkers, nsteps, ncpu = int(SAMPLER['nwalkers']), int(SAMPLER['nsteps']), int(SAMPLER['ncpu'])
     verbose = args.verbose
     ndim = likelihood_manager.num_parameters
-    moves = emcee_moves(SAMPLER['moves'])
+    moves = sampler_utils.emcee_moves(SAMPLER['moves'])
 
     if args.use_physical_coordinates_for_sampling:
         print("WARNING: --use-physical-coordinates-for-sampling is for bilby_mcmc; emcee samples tdinf's sampling coordinates")
@@ -1065,7 +1052,7 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
     print(sampler.get_chain().shape)
 
    # the burn-in and thinning of the old post-processing; main() then saves the table
-    burnin, thin = emcee_burn_in_and_thin(sampler)
+    burnin, thin = sampler_utils.emcee_burn_in_and_thin(sampler)
     samples = sampler.get_chain(discard=burnin, flat=True, thin=thin)
     ln_posterior = sampler.get_log_prob(discard=burnin, flat=True, thin=thin)
 
