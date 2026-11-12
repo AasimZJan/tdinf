@@ -791,6 +791,7 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
             CONSTRUCTOR[key] = value
         elif key in SAMPLER:
             SAMPLER[key] = value
+
     # the swaps between temperatures must carry the exchanged state forward (see make_bilby_swaps_continue); "tdinf_fix_swaps": false switches this off
     if SAMPLER['ntemps'] > 1 and SAMPLER.get('tdinf_fix_swaps', True):
         installed = make_bilby_swaps_continue()
@@ -954,17 +955,23 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
         import emcee
     except ImportError as error:
         raise ImportError("--sampler emcee needs emcee (pip install emcee)") from error
-            
-    settings = dict(nwalkers=args.nwalkers, nsteps=args.nsteps, ncpu=args.ncpu, check_interval=500, tau_multiple=100, tau_tolerance=0.01,
-                    progress=True, moves=None, produce_diagnostics=bool(args.produce_diagnostics))
-    # unknown = sorted(set(sampler_kwargs) - set(settings))
-    # if unknown:
-    #     raise ValueError(f"unknown emcee setting(s) {unknown}; valid settings are {sorted(settings)}")
-    settings.update(sampler_kwargs)
-    nwalkers, nsteps, ncpu = int(settings['nwalkers']), int(settings['nsteps']), int(settings['ncpu'])
+
+    SAMPLER = {'nwalkers':args.nwalkers,
+            'nsteps':args.nsteps,
+            'ncpu':args.ncpu,
+            'check_interval':5000, # can slow down a run as number of steps increase. Keep it high. Exceeding nsteps prevents convergence checking.
+            'tau_multiple':100,
+            'tau_tolerance':0.01,
+            'progress':True,
+            'moves':None,
+            'produce_diagnostics':bool(args.produce_diagnostics),
+            }        
+
+    SAMPLER.update(sampler_kwargs)
+    nwalkers, nsteps, ncpu = int(SAMPLER['nwalkers']), int(SAMPLER['nsteps']), int(SAMPLER['ncpu'])
     verbose = args.verbose
     ndim = likelihood_manager.num_parameters
-    moves = emcee_moves(settings['moves'])
+    moves = emcee_moves(SAMPLER['moves'])
 
     if args.use_physical_coordinates_for_sampling:
         print("WARNING: --use-physical-coordinates-for-sampling is for bilby_mcmc; emcee samples tdinf's sampling coordinates")
@@ -1024,15 +1031,15 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
         # This will be useful for testing convergence
         old_tau = np.inf
         # Cycle through remaining iterations
-        for _ in sampler.sample(p0, iterations=nsteps, progress=bool(settings['progress'])):
+        for _ in sampler.sample(p0, iterations=nsteps, progress=bool(SAMPLER['progress'])):
             # Only check convergence every check_interval steps
-            if sampler.iteration % int(settings['check_interval']):
+            if sampler.iteration % int(SAMPLER['check_interval']):
                 continue
             # Compute the autocorrelation time so far. Using tol=0 means that we'll always get an estimate even if it isn't trustworthy
             tau = sampler.get_autocorr_time(tol=0)
             # Check convergence
-            converged = np.all(tau * float(settings['tau_multiple']) < sampler.iteration)
-            converged &= np.all(np.abs(old_tau - tau) / tau < float(settings['tau_tolerance']))
+            converged = np.all(tau * float(SAMPLER['tau_multiple']) < sampler.iteration)
+            converged &= np.all(np.abs(old_tau - tau) / tau < float(SAMPLER['tau_tolerance']))
             if converged:
                 print(f"Converged at step {sampler.iteration}")
                 break  # if convergence reached before nsteps, stop running
@@ -1040,6 +1047,7 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
 
     print("Available cores: %i" % cpu_count())
     print("Running with %i cores" % ncpu)
+    
     if ncpu > 1 and nsteps > 0:
         # The likelihood manager is passed to the workers once, via the initializer
         with closing(Pool(processes=ncpu, initializer=_init_worker, initargs=(likelihood_manager, verbose))) as pool:
@@ -1061,7 +1069,7 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
     samples = sampler.get_chain(discard=burnin, flat=True, thin=thin)
     ln_posterior = sampler.get_log_prob(discard=burnin, flat=True, thin=thin)
 
-    if settings['produce_diagnostics']:
+    if SAMPLER['produce_diagnostics']:
         try:
             from tdinf.utils import sampler_diagnostics
             args.output_h5 = backend_path        # the diagnostics read the backend through this name
