@@ -128,6 +128,8 @@ class TdinfPriorDictForGWProposal(PriorDict):
 def build_tdinf_gw_cycle(string, priors, warn=True):
     """bilby's gwA cycle (bilby.bilby_mcmc.proposals.get_proposal_cycle) for tdinf's parameters; `string` is e.g. 'tdinf_gw_noFM'"""
     _require_bilby()
+    drop_spin_fisher = "nospinFM" in string
+    string = string.replace("nospinFM", "")
     keys = list(priors.non_fixed_keys)
 
     def group(name):
@@ -154,7 +156,9 @@ def build_tdinf_gw_cycle(string, priors, warn=True):
     if mass:
         plist += [DifferentialEvolutionProposal(priors, weight=SMALL_WEIGHT, subset=mass)] + gmm(mass, SMALL_WEIGHT) + [FisherMatrixProposal(priors, weight=SMALL_WEIGHT, subset=mass)]
     if spin:
-        plist += [DifferentialEvolutionProposal(priors, weight=SMALL_WEIGHT, subset=spin)] + gmm(spin, SMALL_WEIGHT) + [FisherMatrixProposal(priors, weight=BIG_WEIGHT, subset=spin)]
+        plist += [DifferentialEvolutionProposal(priors, weight=SMALL_WEIGHT, subset=spin)] + gmm(spin, SMALL_WEIGHT)
+        if not drop_spin_fisher:
+            plist.append(FisherMatrixProposal(priors, weight=BIG_WEIGHT, subset=spin))
     measured_spin = group("measured_spin")
     if measured_spin:
         plist += [AdaptiveGaussianProposal(priors, weight=SMALL_WEIGHT, subset=measured_spin), FisherMatrixProposal(priors, weight=SMALL_WEIGHT, subset=measured_spin)]
