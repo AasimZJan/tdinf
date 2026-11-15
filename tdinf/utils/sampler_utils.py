@@ -1,47 +1,3 @@
-"""
-sampler_utils: the gravitational-wave proposal cycle of bilby_mcmc ("gwA" in bilby.bilby_mcmc.proposals.get_proposal_cycle) for tdinf's parameter names.
-
-Put this file in tdinf/utils/ and see run_sampler.py for the hook. Use it with  "proposal_cycle": "tdinf_gw"  (or "tdinf_gw_noFM", "tdinf_gw_noFMnoGM", ... as for bilby's names).
-
-Why it is needed
-----------------
-bilby's gwA cycle takes the groups of parameters from the prior dictionary (priors.intrinsic, .extrinsic, .mass, .spin, .measured_spin, .phase, .sky) and the members of each
-group from PARAMETER_SETS in bilby.gw.source, which lists bilby's CBC names (a_1, tilt_1, phi_12, ra, psi, theta_jn, ...). tdinf's names differ (spin1_magnitude, spin1_tilt,
-right_ascension, polarization, inclination, ...), so bilby's own gwA cannot be used. TdinfPriorDict is a prior dictionary that carries the same groups for tdinf's names, and
-build_tdinf_gw_cycle builds the same cycle from them.
-
-The sets (bilby.gw.source.PARAMETER_SETS on bilby's master branch) and their tdinf names
-    bilby set            bilby names                                                          tdinf names
-    spin                 a_1 a_2 tilt_1 tilt_2 phi_12 phi_jl chi_1 chi_2 chi_i_in_plane       spin1/2_magnitude, spin1/2_tilt, spin1/2_azimuth, spin1/2_z; c1, c2 (spin directions)
-    mass                 chirp_mass mass_ratio total_mass mass_1 mass_2                       total_mass, mass_ratio
-    phase                phase                                                                phase
-    intrinsic            spin + mass + phase + tidal                                          the same, plus eccentricity and mean_anomaly when they are sampled
-    extrinsic            luminosity_distance psi theta_jn cos_theta_jn geocent_time ra dec    luminosity_distance, polarization, inclination, cos_inclination, geocenter_time,
-                         zenith azimuth time_jitter                                           right_ascension, declination, sin_declination
-    sky                  ra dec zenith azimuth                                                right_ascension, declination, sin_declination
-    measured_spin        chi_1 chi_2 a_1 a_2 chi_1_in_plane                                   spin1/2_magnitude, spin1/2_z
-    primary_spin_and_q   a_1 chi_1 mass_ratio                                                 spin1_magnitude, spin1_z, mass_ratio
-Note that bilby counts the binary PHASE as intrinsic, not extrinsic (the bilby-MCMC paper does too: 11 intrinsic parameters including the phase, 6 extrinsic ones).
-In sampling coordinates a name is first reduced to its base name (x_total_mass -> total_mass, phase_x -> phase, c1_z -> c1, x_cos_inclination -> cos_inclination).
-
-The cycle (the order, subsets and weights of bilby's gwA; small weight 5, big weight 10, tiny weight 0.5)
-    all parameters:      adaptive Gaussian (AG), differential evolution (DE)
-    intrinsic block:     AG, DE, KDE, Gaussian mixture (GMM)          (the learning proposals with first_fit 1000, 10000 samples, fit_multiplier 2)
-    extrinsic block:     AG, DE, KDE, GMM
-    mass block:          DE, GMM, Fisher matrix
-    spin block:          DE, GMM, Fisher matrix at weight 10
-    measured-spin block: AG, Fisher matrix
-    primary spin and q:  DE                                          (only if there are mass and spin parameters)
-    sky block:           Fisher matrix, GMM
-    prior draws (tiny):  polarization (bilby: psi), spin2_azimuth (bilby: phi_12), spin2_tilt (bilby: tilt_2)
-The names that remove proposals work as for bilby's own: "noFM" removes the Fisher proposals, "noGM" the mixtures, "noKD" the KDEs, "noPR" the prior draws, "noAG", "noDE", ...
-
-Left out, on purpose
-    * bilby's phase proposals (PhaseReversalProposal, CorrelatedPolarisationPhaseJump, PhasePolarisationReversalProposal): no phase jumps for now;
-    * any scaling of the steps (the adaptive Gaussian proposals keep bilby's sigma = 1 for every parameter);
-    * what does not apply to tdinf: tidal parameters, calibration, time_jitter, the in-plane spin parameterisation.
-Different from bilby: if scikit-learn is missing bilby's gwA raises an error; here the mixture proposals are left out with a message.
-"""
 import numpy as np
 
 try:
@@ -58,17 +14,10 @@ except ImportError as _error:            # an emcee-only environment can still i
     PriorDict, _proposals, _BILBY_ERROR = object, None, _error
 
 
-def _require_bilby():
-    if _BILBY_ERROR is not None:
-        raise ImportError(f"the tdinf_gw proposal cycle needs bilby with bilby_mcmc ({_BILBY_ERROR})")
+###########################################################################################
+# bilby_mcmc functions
+###########################################################################################
 
-
-def _require_emcee(what):
-    if emcee is None:
-        raise ImportError(f"{what} needs emcee (pip install emcee)")
-
-
-# ---------------------------------------------------------------------------------------------------------------------------------- the groups, by base name
 SPIN = ["spin1_magnitude", "spin2_magnitude", "spin1_tilt", "spin2_tilt", "spin1_azimuth", "spin2_azimuth", "spin1_z", "spin2_z", "c1", "c2"]
 MASS = ["total_mass", "mass_ratio"]
 PHASE = ["phase"]
@@ -107,7 +56,6 @@ class TdinfPriorDictForGWProposal(PriorDict):
     Each property lists the sampled (non-fixed) parameters of the group; an empty list is false, as bilby's own properties are."""
 
     def __init__(self, *args, **kwargs):
-        _require_bilby()
         super().__init__(*args, **kwargs)
 
     def _group(self, name):
@@ -127,7 +75,6 @@ class TdinfPriorDictForGWProposal(PriorDict):
 # ---------------------------------------------------------------------------------------------------------------------------------- the cycle
 def build_tdinf_gw_cycle(string, priors, warn=True):
     """bilby's gwA cycle (bilby.bilby_mcmc.proposals.get_proposal_cycle) for tdinf's parameters; `string` is e.g. 'tdinf_gw_noFM'"""
-    _require_bilby()
     drop_spin_fisher = "nospinFM" in string
     string = string.replace("nospinFM", "")
     keys = list(priors.non_fixed_keys)
@@ -183,7 +130,6 @@ def register_tdinf_gw_cycle():
     Make the cycle names "tdinf_gw", "tdinf_gw_noFM", ... available to bilby_mcmc: any name that starts with tdinf_gw (what follows is the usual removal string, "noFM" and so on).
     Every other name still goes to bilby. Returns True if installed now, False if it already was.
     """
-    _require_bilby()
     if _INSTALLED[0]:
         return False
     previous = _proposals.get_proposal_cycle
@@ -197,10 +143,130 @@ def register_tdinf_gw_cycle():
     _INSTALLED[0] = True
     return True
 
+def bilby_number_of_chains(sampler_settings):
+    """
+    How many chains bilby_mcmc runs for these settings (as documented): nensemble * ntemps if pt_ensemble is True, otherwise
+    nensemble + ntemps - 1 (only the first ensemble chain is tempered). An explicit initial_betas ladder sets the number of temperatures.
+    """
+    ntemps = len(sampler_settings['initial_betas']) if sampler_settings.get('initial_betas') is not None else int(sampler_settings.get('ntemps', 1))
+    nensemble = int(sampler_settings.get('nensemble', 1))
+    return nensemble * ntemps if sampler_settings.get('pt_ensemble', False) else nensemble + ntemps - 1
 
-# ---------------------------------------------------------------------------------------------------------------------------------- emcee helpers (used by run_emcee)
+
+def get_bilby_initial_samples(likelihood_manager, args, sampler_settings, reference_parameters, ref_pe_samples, get_initial_walkers, likelihood=None, max_tries=20):
+    """
+    One starting point for every chain of the run (see bilby_number_of_chains), taken from the posterior, or None.
+
+    * No posterior to start from (no --initial-walkers and no reference posterior): None, so that bilby draws from the prior itself.
+    * Otherwise the points come from that posterior / backend / walkers through get_initial_walkers (so --initial-sample-select applies),
+      and every one of them has a finite log posterior (impossible points are replaced by random draws; if that does not work after
+      max_tries an error says where to look). The FIRST point is drawn on its own, so that --initial-sample-select applies to it exactly
+      (with max_posterior it is the best row): it is the one bilby_mcmc uses. The others are drawn together; with a selection other than
+      random they are drawn, with repeats possible, from the best rows.
+
+    Returns a list of dictionaries in the coordinates bilby samples: the sampling coordinates (the keys of sampled_keys), or the physical
+    parameters if `likelihood` was built with use_physical_coordinates_for_sampling=True (its physical_parameters_from_sampling converts).
+
+    NOTE: bilby_mcmc takes ONE initial_sample_dict, not one per chain (its documentation, and its log, which prints a single initial
+    sample even for 16 chains). So only the first point can be handed to it; the others are for samplers that take a whole set
+    (emcee, eryn) or for independent runs.
+    """
+    if args.initial_walkers is None and ref_pe_samples is None:
+        return None
+    lm = likelihood_manager
+    n_chains = bilby_number_of_chains(sampler_settings)
+    def draw_finite(count):
+        points = get_initial_walkers(lm, args, count, lm.num_parameters, reference_parameters, ref_pe_samples)
+        return [x for x in points if np.isfinite(lm.get_log_posterior(x))]
+
+    starts = draw_finite(1)                      # the first start alone, following --initial-sample-select exactly
+    if n_chains > 1:
+        starts += draw_finite(n_chains - 1)
+    tries = 0
+    while len(starts) < n_chains and tries < max_tries:
+        starts += draw_finite(n_chains - len(starts))           # replacements for impossible points
+        tries += 1
+    if len(starts) < n_chains:
+        raise RuntimeError(
+            f"only {len(starts)} of the {n_chains} starting points have a finite log posterior after {max_tries} attempts. The starting "
+            "posterior is probably outside the prior bounds (check --total-mass-prior-bounds, --mass-ratio-prior-bounds, "
+            "--spin-magnitude-prior-bounds, --luminosity-distance-prior-bounds, --eccentricity-prior-bounds and the time prior).")
+    if likelihood is not None and likelihood.use_physical:
+        return [likelihood.physical_parameters_from_sampling(x) for x in starts]
+    return [{key: float(value) for key, value in zip(lm.sampled_keys, x)} for x in starts]
+
+def make_bilby_swaps_continue():
+    """
+    Make the temperature swaps of bilby_mcmc carry the exchanged state forward.
+
+    In the bilby_mcmc code this was checked against, an accepted swap does `chain[-1] = other_state`, which rewrites only the STORED last row of the two chains.
+    Each chain goes on stepping from `chain.current_sample`, which is not updated, so the exchanged states never become the chains' states: the hot chains do not
+    feed the cold chains, and the recorded cold-chain rows at the swap iterations are copies from the neighbouring temperature (the pickled chains of a real run showed
+    this directly: after 41-47% of the swap iterations the cold chain continued from its own old state, matching the swap acceptance).
+    This wraps `swap_tempered_chains`: bilby's own swap runs first, then every chain continues from the state stored in its last row. For a chain that did not swap, that
+    row equals its current sample, so nothing changes; for a bilby that already continues from the swapped state it is a no-op. Only the main process is affected (the
+    swaps are done there; the workers only step the chains). Returns True if the wrapper was installed now, False if it already was, None if bilby's class is not available.
+    """
+    try:
+        from bilby.bilby_mcmc.sampler import BilbyPTMCMCSampler
+    except ImportError:
+        return None
+    bilby_swap = BilbyPTMCMCSampler.swap_tempered_chains
+    if getattr(bilby_swap, '_tdinf_continues', False):
+        return False
+
+    def swap_and_continue(self):
+        bilby_swap(self)
+        for samplers in self.sampler_dictionary.values():
+            for sampler in samplers:
+                sampler.chain.current_sample = sampler.chain[-1]
+
+    swap_and_continue._tdinf_continues = True
+    BilbyPTMCMCSampler.swap_tempered_chains = swap_and_continue
+    return True
+
+def make_bilby_chains_ship_light(headroom=1000):
+    """
+    Send each bilby_mcmc chain to the worker processes without its unused empty rows.
+
+    With a pool, bilby pickles every sampler, chain included, to a worker and back at EVERY iteration. A chain stores its samples in an array that is allocated in blocks of
+    100000 rows, so all of it is sent although only the first `position + 1` rows are filled (a checkpoint of a 16-chain run is 220 MB at 34000 rows). This gives `Chain` a
+    __getstate__ that keeps only the filled rows and a __setstate__ that restores `headroom` empty rows (and extends by that much when they run out), so the amount sent is
+    that of the samples actually stored. The chain itself is unchanged, and older checkpoints load as before. It has to be installed before the pool is created, so that the
+    workers have it too, which holds for the default 'fork' start method; with 'spawn' only the trip to the workers is lighter.
+    Returns True if installed now, False if it already was, None if bilby's class is not available.
+    """
+    try:
+        from bilby.bilby_mcmc.chain import Chain
+    except ImportError:
+        return None
+    if getattr(Chain, '_tdinf_light', False):
+        return False
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        filled = self.position + 1
+        state['_chain_array'] = self._chain_array[:filled]
+        state['_chain_array_length'] = filled
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        filled = self.position + 1
+        columns = self._chain_array.shape[1]
+        self._chain_array = np.concatenate((self._chain_array[:filled], np.zeros((headroom, columns))), axis=0)
+        self._chain_array_length = len(self._chain_array)
+        self.block_length = headroom
+
+    Chain.__getstate__ = __getstate__
+    Chain.__setstate__ = __setstate__
+    Chain._tdinf_light = True
+    return True
+
+###########################################################################################
+# emcee functions
+###########################################################################################
 EMCEE_MOVES = {'stretch': 'StretchMove', 'de': 'DEMove', 'snooker': 'DESnookerMove', 'walk': 'WalkMove'}
-
 
 def emcee_moves(spec):
     """
@@ -227,6 +293,35 @@ def emcee_burn_in_and_thin(sampler):
     """The burn-in and thinning the old script used (utils.postprocess_samples): 5 x the largest and 0.5 x the smallest autocorrelation time."""
     tau = sampler.get_autocorr_time(quiet=True)
     try:
+        burnin = max(int(5 * np.max(tau)), 0)
+        thin = max(int(0.5 * np.min(tau)), 1)
+        print(f'burnin = {burnin}, thin = {thin}')
+    except Exception:
+        print('WARNING thinning by 1, 0 burnin!')
+        burnin = 0
+        thin = 1
+    return burnin, thin
+
+###########################################################################################
+# eryn functions
+###########################################################################################
+
+def eryn_moves(spec):
+    """The `moves` of Eryn's EnsembleSampler from the "moves" setting: None or "stretch" is Eryn's default; "de" is differential evolution (if this Eryn has DEMove)."""
+    if spec is None or spec == 'stretch':
+        return None
+    if spec == 'de':
+        import eryn.moves
+        if not hasattr(eryn.moves, 'DEMove'):
+            raise ValueError("this Eryn has no DEMove")
+        return [(eryn.moves.DEMove(), 1.0)]
+    raise ValueError(f"the Eryn setting 'moves' must be null, 'stretch' or 'de', not {spec!r}")
+
+
+def eryn_burn_in_and_thin(cold_chain):
+    """The burn-in and thinning of run_emcee (5 x the largest and 0.5 x the smallest autocorrelation time), here of the COLD chain, shape (steps, walkers, ndim)."""
+    try:
+        tau = emcee.autocorr.integrated_time(cold_chain, c=5, tol=0, quiet=True)
         burnin = max(int(5 * np.max(tau)), 0)
         thin = max(int(0.5 * np.min(tau)), 1)
         print(f'burnin = {burnin}, thin = {thin}')
