@@ -139,16 +139,17 @@ def create_run_sampler_arg_parser():
     p.add_argument('--spin-magnitude-prior-bounds', type=float, nargs=2, default=[0, 0.99],
                    help="Spin magnitude bounds for spin magnitude prior."
                         "Default: [0,0.99]")
+    p.add_argument('--eccentricity-prior-bounds', type=float, nargs=2, default=[0.0, 0.4],
+                       help="eccentricity bounds for eccentricity prior."
+                            "Default: [0.0, 0.4]")
     p.add_argument('--time-prior-sigma', type=float, default=0.01,
                    help="Standard deviation of time prior [s.]"
                         "Default: 0.01 s")
     p.add_argument('--use-lvk-mass-and-time-prior', default=False, action='store_true',
                    help="Use uniform in detector frame mass and time prior.")
-    p.add_argument('--eccentricity-prior-bounds', type=float, nargs=2, default=[0.0, 0.4],
-                   help="eccentricity bounds for eccentricity prior."
-                        "Default: [0.0, 0.4]")
+    
 
-    # Do we want to resume an old run? (passed on to samplers that can: for bilby_mcmc it sets 'resume')
+    # Do we want to resume an old run? 
     p.add_argument('--resume', action='store_true',
                    help='Resume from the sampler\'s own checkpoint files in the output folder, if the sampler supports it. '
                         '!! Recommended to include !!')
@@ -584,63 +585,6 @@ def build_likelihood_manager(args, kwargs, psd_dict, time_dict, data_dict):
         **kwargs
     )
 
-###########################################################################################
-# bilby_mcmc function
-###########################################################################################
-
-def bilby_number_of_chains(sampler_settings):
-    """
-    How many chains bilby_mcmc runs for these settings (as documented): nensemble * ntemps if pt_ensemble is True, otherwise
-    nensemble + ntemps - 1 (only the first ensemble chain is tempered). An explicit initial_betas ladder sets the number of temperatures.
-    """
-    ntemps = len(sampler_settings['initial_betas']) if sampler_settings.get('initial_betas') is not None else int(sampler_settings.get('ntemps', 1))
-    nensemble = int(sampler_settings.get('nensemble', 1))
-    return nensemble * ntemps if sampler_settings.get('pt_ensemble', False) else nensemble + ntemps - 1
-
-
-def get_bilby_initial_samples(likelihood_manager, args, sampler_settings, reference_parameters, ref_pe_samples, likelihood=None, max_tries=20):
-    """
-    One starting point for every chain of the run (see bilby_number_of_chains), taken from the posterior, or None.
-
-    * No posterior to start from (no --initial-walkers and no reference posterior): None, so that bilby draws from the prior itself.
-    * Otherwise the points come from that posterior / backend / walkers through get_initial_walkers (so --initial-sample-select applies),
-      and every one of them has a finite log posterior (impossible points are replaced by random draws; if that does not work after
-      max_tries an error says where to look). The FIRST point is drawn on its own, so that --initial-sample-select applies to it exactly
-      (with max_posterior it is the best row): it is the one bilby_mcmc uses. The others are drawn together; with a selection other than
-      random they are drawn, with repeats possible, from the best rows.
-
-    Returns a list of dictionaries in the coordinates bilby samples: the sampling coordinates (the keys of sampled_keys), or the physical
-    parameters if `likelihood` was built with use_physical_coordinates_for_sampling=True (its physical_parameters_from_sampling converts).
-
-    NOTE: bilby_mcmc takes ONE initial_sample_dict, not one per chain (its documentation, and its log, which prints a single initial
-    sample even for 16 chains). So only the first point can be handed to it; the others are for samplers that take a whole set
-    (emcee, eryn) or for independent runs.
-    """
-    if args.initial_walkers is None and ref_pe_samples is None:
-        return None
-    lm = likelihood_manager
-    n_chains = bilby_number_of_chains(sampler_settings)
-    def draw_finite(count):
-        points = get_initial_walkers(lm, args, count, lm.num_parameters, reference_parameters, ref_pe_samples)
-        return [x for x in points if np.isfinite(lm.get_log_posterior(x))]
-
-    starts = draw_finite(1)                      # the first start alone, following --initial-sample-select exactly
-    if n_chains > 1:
-        starts += draw_finite(n_chains - 1)
-    tries = 0
-    while len(starts) < n_chains and tries < max_tries:
-        starts += draw_finite(n_chains - len(starts))           # replacements for impossible points
-        tries += 1
-    if len(starts) < n_chains:
-        raise RuntimeError(
-            f"only {len(starts)} of the {n_chains} starting points have a finite log posterior after {max_tries} attempts. The starting "
-            "posterior is probably outside the prior bounds (check --total-mass-prior-bounds, --mass-ratio-prior-bounds, "
-            "--spin-magnitude-prior-bounds, --luminosity-distance-prior-bounds, --eccentricity-prior-bounds and the time prior).")
-    if likelihood is not None and likelihood.use_physical:
-        return [likelihood.physical_parameters_from_sampling(x) for x in starts]
-    return [{key: float(value) for key, value in zip(lm.sampled_keys, x)} for x in starts]
-
-
 def save_posterior(samples, ln_posterior, likelihood_manager, output, **kwargs):
     """
     Turn samples (n, ndim) in sampling coordinates and their ln posterior into the usual tdinf table (physical parameters,
@@ -652,73 +596,9 @@ def save_posterior(samples, ln_posterior, likelihood_manager, output, **kwargs):
     print("File saved: %r" % sample_path)
     return df
 
-def make_bilby_swaps_continue():
-    """
-    Make the temperature swaps of bilby_mcmc carry the exchanged state forward.
-
-    In the bilby_mcmc code this was checked against, an accepted swap does `chain[-1] = other_state`, which rewrites only the STORED last row of the two chains.
-    Each chain goes on stepping from `chain.current_sample`, which is not updated, so the exchanged states never become the chains' states: the hot chains do not
-    feed the cold chains, and the recorded cold-chain rows at the swap iterations are copies from the neighbouring temperature (the pickled chains of a real run showed
-    this directly: after 41-47% of the swap iterations the cold chain continued from its own old state, matching the swap acceptance).
-    This wraps `swap_tempered_chains`: bilby's own swap runs first, then every chain continues from the state stored in its last row. For a chain that did not swap, that
-    row equals its current sample, so nothing changes; for a bilby that already continues from the swapped state it is a no-op. Only the main process is affected (the
-    swaps are done there; the workers only step the chains). Returns True if the wrapper was installed now, False if it already was, None if bilby's class is not available.
-    """
-    try:
-        from bilby.bilby_mcmc.sampler import BilbyPTMCMCSampler
-    except ImportError:
-        return None
-    bilby_swap = BilbyPTMCMCSampler.swap_tempered_chains
-    if getattr(bilby_swap, '_tdinf_continues', False):
-        return False
-
-    def swap_and_continue(self):
-        bilby_swap(self)
-        for samplers in self.sampler_dictionary.values():
-            for sampler in samplers:
-                sampler.chain.current_sample = sampler.chain[-1]
-
-    swap_and_continue._tdinf_continues = True
-    BilbyPTMCMCSampler.swap_tempered_chains = swap_and_continue
-    return True
-
-def make_bilby_chains_ship_light(headroom=1000):
-    """
-    Send each bilby_mcmc chain to the worker processes without its unused empty rows.
-
-    With a pool, bilby pickles every sampler, chain included, to a worker and back at EVERY iteration. A chain stores its samples in an array that is allocated in blocks of
-    100000 rows, so all of it is sent although only the first `position + 1` rows are filled (a checkpoint of a 16-chain run is 220 MB at 34000 rows). This gives `Chain` a
-    __getstate__ that keeps only the filled rows and a __setstate__ that restores `headroom` empty rows (and extends by that much when they run out), so the amount sent is
-    that of the samples actually stored. The chain itself is unchanged, and older checkpoints load as before. It has to be installed before the pool is created, so that the
-    workers have it too, which holds for the default 'fork' start method; with 'spawn' only the trip to the workers is lighter.
-    Returns True if installed now, False if it already was, None if bilby's class is not available.
-    """
-    try:
-        from bilby.bilby_mcmc.chain import Chain
-    except ImportError:
-        return None
-    if getattr(Chain, '_tdinf_light', False):
-        return False
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        filled = self.position + 1
-        state['_chain_array'] = self._chain_array[:filled]
-        state['_chain_array_length'] = filled
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        filled = self.position + 1
-        columns = self._chain_array.shape[1]
-        self._chain_array = np.concatenate((self._chain_array[:filled], np.zeros((headroom, columns))), axis=0)
-        self._chain_array_length = len(self._chain_array)
-        self.block_length = headroom
-
-    Chain.__getstate__ = __getstate__
-    Chain.__setstate__ = __setstate__
-    Chain._tdinf_light = True
-    return True
+###########################################################################################
+# bilby_mcmc function
+##########################################################################################
 
 def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_parameters, ref_pe_samples):
     """
@@ -805,12 +685,12 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
 
     # the swaps between temperatures must carry the exchanged state forward (see make_bilby_swaps_continue); "tdinf_fix_swaps": false switches this off
     if SAMPLER['ntemps'] > 1 and SAMPLER.get('tdinf_fix_swaps', True):
-        installed = make_bilby_swaps_continue()
+        installed = sampler_utils.make_bilby_swaps_continue()
         print({True: "tempered chains: temperature swaps now carry the exchanged state forward", False: "tempered chains: swap wrapper already installed", None: "WARNING: could not install the swap wrapper (bilby's BilbyPTMCMCSampler not found)"}[installed])
 
     # with a pool, send the chains to the workers without their unused empty rows (see make_bilby_chains_ship_light); "tdinf_light_chains": false switches this off
     if CONSTRUCTOR['npool'] > 1 and SAMPLER.get('tdinf_light_chains', True):
-        installed = make_bilby_chains_ship_light()
+        installed = sampler_utils.make_bilby_chains_ship_light()
         print({True: "pool: chains are now sent to the workers without their unused empty rows", False: "pool: light-chain wrapper already installed", None: "WARNING: could not install the light-chain wrapper (bilby's Chain not found)"}[installed])
 
     print('Constructor arguments:', CONSTRUCTOR)
@@ -821,10 +701,6 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
     
     # the proposal cycle "tdinf_gw" ("tdinf_gw_noFM", ...)
     if str(SAMPLER['proposal_cycle']).startswith('tdinf_gw'):
-        try:
-            from tdinf.utils import sampler_utils
-        except ImportError as error:
-            raise RuntimeError('proposal_cycle "tdinf_gw" needs tdinf/utils/sampler_utils.py and a bilby with bilby_mcmc') from error
         prior_dict = sampler_utils.TdinfPriorDictForGWProposal(prior_dict)
         sampler_utils.register_tdinf_gw_cycle()
         print(f"proposal cycle {SAMPLER['proposal_cycle']} installed: bilby's gwA for tdinf's parameters; parameters per group "
@@ -836,7 +712,7 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
     # the starting point, from the posterior if the user gave one (--initial-walkers or a reference posterior); otherwise bilby draws
     # it from the prior. bilby_mcmc takes a single initial_sample_dict, so the first of the starting points is used.
     # if SAMPLER['initial_sample_dict'] is None:
-    #     starts = get_bilby_initial_samples(likelihood_manager, args, SAMPLER, reference_parameters, ref_pe_samples, likelihood=likelihood)
+    #     starts = sampler_utils.get_bilby_initial_samples(likelihood_manager, args, SAMPLER, reference_parameters, ref_pe_samples, get_initial_walkers, likelihood=likelihood)
     #     if starts is not None:
     #         SAMPLER['initial_sample_dict'] = starts[0]
     #         if len(starts) > 1:
@@ -845,7 +721,7 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
     #         print("No posterior to start from: bilby draws the starting point from the prior.")
 
     print(f"\nbilby_mcmc {bilby.__version__}: {len(prior_dict)} parameters in {'physical' if physical else 'sampling'} coordinates, "
-          f"{bilby_number_of_chains(SAMPLER)} chains, outdir={outdir}, label={label}")
+          f"{sampler_utils.bilby_number_of_chains(SAMPLER)} chains, outdir={outdir}, label={label}")
 
     # avoid oversubscribing the cores with BLAS / OpenMP threads in the workers (as the emcee code did)
     if CONSTRUCTOR['npool'] > 1:
@@ -932,11 +808,12 @@ class _ChunkOnePool:
     balances the load when waveform runtimes differ between walkers (the default
     Pool.map gives each worker a chunk of several walkers at once).
     """
-    def __init__(self, pool):
+    def __init__(self, pool, chunksize=1):
         self.pool = pool
+        self.chunksize = max(int(chunksize), 1)
 
     def map(self, func, iterable):
-        return self.pool.map(func, iterable, chunksize=1)
+        return self.pool.map(func, iterable, chunksize=self.chunksize)
 
 
 def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parameters, ref_pe_samples):
@@ -1072,17 +949,6 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
 ###########################################################################################
 # Eryn functions
 ###########################################################################################
-"""
-Eryn and pickling.
-
-With a pool, Eryn sends its log-likelihood function (and the arguments it was given) to the worker processes with every task, so everything it
-holds must be picklable, and anything large is re-sent every time. Therefore:
-  * the function Eryn is given is the module-level `_eryn_log_like`: it is pickled by NAME (no closure, lambda or bound method);
-  * it takes no `args` / `kwargs`: the likelihood manager (data, ACFs, waveform generator) is sent to each worker ONCE by the Pool initializer
-    `_init_worker` (the one run_emcee uses), and read from the module global `_LM`; with --ncpu 1 the same global is set in this process;
-  * the pool Eryn gets is `_ChunkOnePool`, which is only ever asked for `.map`, so it is never pickled; the prior object, the sampler and the HDF5
-    backend stay in the main process.
-"""
 
 ERYN_BRANCH = 'tdinf'          # Eryn calls a group of parameters a "branch". tdinf has one branch with one leaf (one signal).
 ERYN_BAD_LIKELIHOOD = -1e300   # a failed waveform: very negative but finite, so that beta * lnL is not NaN for a beta = 0 chain
@@ -1104,12 +970,9 @@ def _eryn_log_like(x):
     if x.size != ndim:
         raise ValueError(f"Eryn passed {x.size} values for one walker, expected one leaf of {ndim}: this runner uses one branch with one leaf")
     x = x.reshape(ndim)
-    x_phys = lm.samp_to_phys(x)
-    # as in get_log_posterior, the prior decides first: outside its support the point is rejected by Eryn's prior and no waveform is made
-    if not np.isfinite(lm.log_prior.get_lnprior(x, phys_dict=x_phys, use_lvk_mass_and_time_prior=lm.use_lvk_mass_and_time_prior)):
-        return 0.0
     if lm.only_prior:
         return 0.0
+    x_phys = lm.samp_to_phys(x)
     value = lm.get_log_likelihood(x_phys)
     return float(value) if np.isfinite(value) else ERYN_BAD_LIKELIHOOD
 
@@ -1152,75 +1015,10 @@ def _eryn_prior_class():
     globals()['TdinfPrior'] = TdinfPrior
     return TdinfPrior
 
-
-def _eryn_accepted_kwargs(function, wanted, name, essential=()):
-    """
-    Only the keyword arguments that the INSTALLED Eryn accepts, so that a difference between Eryn versions is reported clearly. A missing one in
-    `essential` is an error that prints the installed signature; any other is dropped with a note.
-    """
-    import inspect
-    signature = inspect.signature(function)
-    parameters = signature.parameters
-    takes_anything = any(p.kind == p.VAR_KEYWORD for p in parameters.values())
-    missing = [k for k in wanted if k not in parameters and not takes_anything]
-    lost = [k for k in missing if k in essential]
-    if lost:
-        raise RuntimeError(f"the installed Eryn's {name} does not accept {lost}, which this runner needs. Its signature is {name}{signature}. "
-                           "Please compare it with what run_eryn passes (nwalkers, ndims, log_like_fn, priors, tempering_kwargs, branch_names, ...).")
-    if missing:
-        print(f"NOTE: the installed Eryn's {name} has no {missing}: not passed")
-    return {k: v for k, v in wanted.items() if k not in missing}
-
-
-def eryn_moves(spec):
-    """The `moves` of Eryn's EnsembleSampler from the "moves" setting: None or "stretch" is Eryn's default; "de" is differential evolution (if this Eryn has DEMove)."""
-    if spec is None or spec == 'stretch':
-        return None
-    if spec == 'de':
-        import eryn.moves
-        if not hasattr(eryn.moves, 'DEMove'):
-            raise ValueError("this Eryn has no DEMove")
-        return [(eryn.moves.DEMove(), 1.0)]
-    raise ValueError(f"the Eryn setting 'moves' must be null, 'stretch' or 'de', not {spec!r}")
-
-
-def eryn_burn_in_and_thin(cold_chain):
-    """The burn-in and thinning of run_emcee (5 x the largest and 0.5 x the smallest autocorrelation time), here of the COLD chain, shape (steps, walkers, ndim)."""
-    try:
-        tau = emcee.autocorr.integrated_time(cold_chain, c=5, tol=0, quiet=True)
-        burnin = max(int(5 * np.max(tau)), 0)
-        thin = max(int(0.5 * np.min(tau)), 1)
-        print(f'burnin = {burnin}, thin = {thin}')
-    except Exception:
-        print('WARNING thinning by 1, 0 burnin!')
-        burnin = 0
-        thin = 1
-    return burnin, thin
-
-
 def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_parameters, ref_pe_samples):
     """
-    Run Eryn, with the structure of run_emcee: the walkers are saved to an HDF5 backend (<output without extension>.h5), --resume continues from its
-    last step, and the run stops early once the autocorrelation time of the cold chain has converged. Returns (samples, ln_posterior) in tdinf's
-    sampling coordinates after the burn-in and thinning of run_emcee, so main() saves the same .dat file. Only the COLD chain (temperature index 0)
-    is returned. Eryn tempers the likelihood only: the likelihood is `_eryn_log_like`, the prior is tdinf's own (TdinfPrior).
-
-    Settings (--sampler-kwargs; the old options --nwalkers, --nsteps and --ncpu, if given, are the defaults):
-      nwalkers (512) walkers PER TEMPERATURE, nsteps (50000), ncpu (4: a pool of worker processes; 1 runs in this process),
-      ntemps (1: no tempering, like emcee), tempering ({}: more tempering_kwargs of Eryn, for example {"Tmax": 100}),
-      check_interval (500), tau_multiple (100), tau_tolerance (0.01): as in run_emcee,
-      progress (true), moves (null: Eryn's default; "de").
+    Run Eryn.
     """
-    global _LM, _VERBOSE
-    settings = dict(nwalkers=args.nwalkers, nsteps=args.nsteps, ncpu=args.ncpu, ntemps=1, tempering={}, check_interval=500, tau_multiple=100,
-                    tau_tolerance=0.01, progress=True, moves=None)
-    unknown = sorted(set(sampler_kwargs) - set(settings))
-    if unknown:
-        raise ValueError(f"unknown eryn setting(s) {unknown}; valid settings are {sorted(settings)}")
-    settings.update(sampler_kwargs)
-    nwalkers, nsteps, ncpu, ntemps = int(settings['nwalkers']), int(settings['nsteps']), int(settings['ncpu']), int(settings['ntemps'])
-    verbose = args.verbose
-    ndim = likelihood_manager.num_parameters
     try:
         import eryn
         from eryn.ensemble import EnsembleSampler
@@ -1228,51 +1026,132 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
         from eryn.backends import HDFBackend
     except ImportError as error:
         raise ImportError("--sampler eryn needs eryn (pip install eryn)") from error
-    moves = eryn_moves(settings['moves'])
-
-    if args.use_physical_coordinates_for_sampling:
-        print("WARNING: --use-physical-coordinates-for-sampling is for bilby_mcmc; eryn samples tdinf's sampling coordinates")
-    if args.produce_diagnostics:
-        print("NOTE: --produce-diagnostics reads an emcee backend; it is skipped for eryn")
-    print(f"eryn {getattr(eryn, '__version__', '?')}: {ntemps} temperature(s) x {nwalkers} walkers, {ndim} parameters")
+    global _LM, _VERBOSE
 
     # where Eryn saves its output while the sampler runs
     backend_path = args.output if args.output.endswith('.h5') else os.path.splitext(args.output)[0] + '.h5'
     os.makedirs(os.path.dirname(backend_path) or '.', exist_ok=True)
+
+    ndim = likelihood_manager.num_parameters
+
+    # Arguments of the Eryn EnsembleSampler constructor
+    CONSTRUCTOR = dict(
+        # the ensemble
+        nwalkers=128,                    # walkers PER TEMPERATURE
+        ndims=ndim,                      # dimensions of each branch: an int, a list or a dict (required); tdinf: one branch with all the sampled parameters
+        log_like_fn=_eryn_log_like,      # log LIKELIHOOD; Eryn tempers only this, the prior is separate
+        priors={ERYN_BRANCH: _eryn_prior_class()(likelihood_manager)},  # prior with a logpdf method
+        branch_names=[ERYN_BRANCH],      # (None) names of the branches (models); None gives model_0, model_1, ...
+        nbranches=1,                     # (1) number of branches; only used if branch_names is None
+        nleaves_max=1,                   # (1) maximum leaves (sources) per branch; 1 is a plain fixed-dimension model
+        nleaves_min=1,                   # (0) minimum leaves per branch; only used with reversible jump
+        # tempering
+        tempering_kwargs={"ntemps": 1},  # ({}) arguments of eryn.moves.tempering.TemperatureControl; {} means NO tempering. tempering_kwargs={"ntemps": 5, "Tmax": 5.3}, {"ntemps": 5, "Tmax": 5.3, "stop_adaptation": 5000}, {"betas": [1.0, 0.72, 0.49, 0.307, 0.19], "adaptive": False}
+        # proposals
+        moves=None,                      # (None) one move, a list, or a weighted list [(move, weight), ...]; None is a single StretchMove(a=2.0). From --sampler-kwargs: None, "stretch" or "de"
+        rj_moves=None,                   # (None) reversible-jump moves: None/False off, True, "together", "iterate_branches" or "separate_branches"; needs moves to be set. Not used by tdinf
+        periodic=None,                   # (None) {branch name: {parameter index: period}}, treated as periodic in proposals. tdinf samples logistic/Cartesian coordinates: none needed
+        # the likelihood call and parallelisation
+        # pool=pool,                     # (None) an object with a map method; made below from ncpu (a pool of worker processes, or none for ncpu 1)
+        args=None,                       # (None) extra positional arguments for log_like_fn
+        kwargs=None,                     # (None) extra keyword arguments for log_like_fn
+        # storage and resume
+        backend=backend_path,            # (None) None is an in-memory Backend; a string is a path for an HDFBackend; replaced below by the HDFBackend object of the resume logic
+        track_moves=True,                # (True) store the acceptance of every move; on --resume, CHANGING THE MOVES RAISES ValueError (use a new backend or False)
+        info={},                         # ({}) extra key/value pairs stored in a new backend
+        # updates, stopping and plots
+        update_fn=None,                  # (None) callable (iteration, state, sampler), e.g. eryn.utils.updates.AdjustStretchProposalScale; called inside sample() too
+        update_iterations=-1,            # (-1) iterations between update_fn calls (counted at the thinning rate); -1 is never
+        stopping_fn=None,                # (None) eryn.utils.stopping.Stopping object; only called by run_mcmc, NOT by sample(), so tdinf's own tau check does the stopping
+        stopping_iterations=-1,          # (-1) iterations between stopping_fn calls; -1 is never
+    )
+
+    # Arguments of sampler.sample(...) and the settings of the loop around it; run_mcmc(initial_state, nsteps, burn=None, post_burn_update=False, **kwargs) passes the rest on to sample
+    SAMPLER = dict(
+        # initial_state=state,           # a State, an array [ntemps, nwalkers, nleaves_max, ndim] or a dict per branch (required); the start or the last backend step, given below
+        iterations=100000,               # (1) number of iterations (thin_by x iterations proposals); None is an endless stream and needs store=False
+        thin_by=1,                       # (1) store and yield only every thin_by-th step; tdinf's loop counts yielded steps, so keep 1 unless you change it
+        store=True,                      # (True) write the steps to the backend; False is for burn-in
+        progress=True,                   # (False) progress bar; True or "notebook"
+        tune=False,                      # (False) let some moves tune their own parameters while running
+        skip_initial_state_check=True,   # (True) skip the check that the initial state can explore the space
+        # tdinf's own settings (not arguments of sample)
+        ncpu=4,                          # (--ncpu) worker processes of the pool; 1 runs in this process
+        check_interval=5000,             # (5000) steps between convergence checks
+        tau_multiple=100,                # (100) converged when tau x tau_multiple < the number of steps, for every parameter
+        tau_tolerance=0.01,              # (0.01) and the relative change of tau since the last check is below this
+        chunksize=1,                     # (1) walkers handed to a worker at a time; 1 balances the load best, 2-4 cuts the dispatch cost when waveform runtimes are similar
+    )
+    SAMPLE_ARGUMENTS = ('thin_by', 'store', 'progress', 'tune', 'skip_initial_state_check')      # the keys of SAMPLER that sample() takes, besides iterations
+
+    for key, value in sampler_kwargs.items():
+        if key in CONSTRUCTOR:
+            CONSTRUCTOR[key] = value
+        elif key in SAMPLER:
+            SAMPLER[key] = value
+        else:
+            raise ValueError(f"unknown eryn setting {key!r}; valid settings are {sorted(CONSTRUCTOR) + sorted(SAMPLER)}")
+    
+    # the number of temperatures is needed before the sampler exists, for the shape of the starting state
+    tempering = CONSTRUCTOR['tempering_kwargs']
+    if tempering.get('betas') is not None:
+        tempering = CONSTRUCTOR['tempering_kwargs'] = dict(tempering, betas=np.asarray(tempering['betas'], dtype=float))
+        ntemps = len(tempering['betas'])
+    elif tempering.get('ntemps') is not None:
+        ntemps = int(tempering['ntemps'])
+    else:
+        raise ValueError("tempering_kwargs needs 'ntemps' (or 'betas'): run_eryn has to know the number of temperatures before the sampler is made")
+    
+    nwalkers, iterations, ncpu = int(CONSTRUCTOR['nwalkers']), int(SAMPLER['iterations']), int(SAMPLER['ncpu'])
+    verbose = args.verbose
+    if CONSTRUCTOR['moves'] is None or isinstance(CONSTRUCTOR['moves'], str):
+        CONSTRUCTOR['moves'] = sampler_utils.eryn_moves(CONSTRUCTOR['moves'])
+
+    if args.use_physical_coordinates_for_sampling:
+        print("WARNING: --use-physical-coordinates-for-sampling is for bilby_mcmc; eryn samples tdinf's sampling coordinates")
+    if verbose:
+        print("Sampling %i parameters." % ndim)
 
     # Resume if we want
     resumed = False
     if args.resume and os.path.isfile(backend_path):
         backend = HDFBackend(backend_path)
         try:
-            state = backend.get_last_sample()        # the last state of the old run is the new starting state
+            # Load in last state to use as the new starting state
+            state = backend.get_last_sample()
+            # adjust number of steps
             steps_done = int(backend.iteration)
             if steps_done < 1:
                 raise AttributeError('no steps in the backend')
             resumed = True
         except (AttributeError, KeyError, OSError, ValueError):
-            # the file was made but the job crashed before writing any steps: start a new one
+            # This happens when the file has been made but the job crashed before writing any points to it.
+            # So we overwrite it
             print('WARNING! Backend was empty, resetting backend')
             os.remove(backend_path)
+    # a fresh run replaces the old backend, as backend.reset did for emcee
     elif os.path.isfile(backend_path):
-        os.remove(backend_path)                      # a fresh run replaces the old backend, as backend.reset did for emcee
+        os.remove(backend_path)
     if resumed:
-        nsteps = nsteps - steps_done
+        iterations = iterations - steps_done
+        # a resumed run keeps the shape of its backend, so the settings that make the shape follow it
         for name, value in (('nwalkers', nwalkers), ('ntemps', ntemps)):
             in_backend = getattr(backend, name, None)
             if in_backend is not None and int(in_backend) != value:
                 print(f"NOTE: the backend has {int(in_backend)} {name}, not {value}: continuing with {int(in_backend)}")
                 if name == 'nwalkers':
                     nwalkers = int(in_backend)
+                    CONSTRUCTOR['nwalkers'] = nwalkers
                 else:
                     ntemps = int(in_backend)
+                    if tempering.get('betas') is None:
+                        CONSTRUCTOR['tempering_kwargs'] = dict(tempering, ntemps=ntemps)
     else:
         backend = HDFBackend(backend_path)
         p0 = get_initial_walkers(likelihood_manager, args, ntemps * nwalkers, ndim, reference_parameters, ref_pe_samples)
         coords = np.asarray(getattr(p0, 'coords', p0), dtype=float).reshape(ntemps, nwalkers, 1, ndim)
-        state_arguments = _eryn_accepted_kwargs(State.__init__, dict(coords={ERYN_BRANCH: coords}, inds={ERYN_BRANCH: np.ones((ntemps, nwalkers, 1), dtype=bool)}),
-                                                'State.__init__', essential=('coords',))
-        state = State(**state_arguments)
+        state = State(coords={ERYN_BRANCH: coords}, inds={ERYN_BRANCH: np.ones((ntemps, nwalkers, 1), dtype=bool)})
+    CONSTRUCTOR['backend'] = backend     # the one object, so that the sampler and the lines below read and write the same backend
 
     # Avoid oversubscribing cores with BLAS/OpenMP threads (see run_emcee)
     if ncpu > 1:
@@ -1285,76 +1164,86 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
 
     # the cold chain of the old steps (a resumed run), and of the new ones as they are made, for the convergence check
     cold_old = np.empty((0, nwalkers, ndim))
+    ln_like_old = ln_prior_old = np.empty((0, nwalkers))
     if resumed:
         previous = backend.get_chain()
         previous = np.asarray(previous[ERYN_BRANCH] if isinstance(previous, dict) else previous)
-        cold_old = previous.reshape(previous.shape[0], ntemps, nwalkers, ndim)[:, 0]
-    cold_new = []
+        cold_old = previous.reshape(previous.shape[0], ntemps, nwalkers, ndim)[:, 0].copy()      
+        del previous
+        ln_like_old = np.asarray(backend.get_log_like())[:, 0].copy()
+        ln_prior_old = np.asarray(backend.get_log_prior())[:, 0].copy()
+    n_total = max(iterations, 0)
+    cold_new = np.empty((n_total, nwalkers, ndim))              # filled as the steps come in; the memory is only used where it is written
+    ln_like_new, ln_prior_new = np.empty((n_total, nwalkers)), np.empty((n_total, nwalkers))
+    n_new = 0
 
     def make_sampler(pool):
-        wanted = dict(nwalkers=nwalkers, ndims=ndim, log_like_fn=_eryn_log_like, priors={ERYN_BRANCH: _eryn_prior_class()(likelihood_manager)},
-                      tempering_kwargs=dict(ntemps=ntemps, **settings['tempering']), nbranches=1, branch_names=[ERYN_BRANCH], nleaves_max=1,
-                      nleaves_min=1, pool=pool, backend=backend, moves=moves)
-        accepted = _eryn_accepted_kwargs(EnsembleSampler.__init__, {k: v for k, v in wanted.items() if v is not None or k in ('pool',)}, 'EnsembleSampler.__init__',
-                                         essential=('nwalkers', 'ndims', 'log_like_fn', 'priors', 'branch_names', 'backend', 'tempering_kwargs')
-                                         + (('pool',) if pool is not None else ()) + (('moves',) if moves is not None else ()))
         try:
-            return EnsembleSampler(**accepted)
+            return EnsembleSampler(**CONSTRUCTOR, pool=pool)
         except Exception as error:
-            raise RuntimeError(f"Eryn rejected the arguments {sorted(accepted)}: {error!r}. Installed signature: EnsembleSampler{__import__('inspect').signature(EnsembleSampler.__init__)}") from error
+            raise RuntimeError(f"Eryn rejected the arguments {sorted(CONSTRUCTOR)}: {error!r}. Installed signature: EnsembleSampler{__import__('inspect').signature(EnsembleSampler.__init__)}") from error
 
     def sample(sampler):
+        nonlocal n_new
         # If there are still iterations left to run ...
-        if nsteps <= 0:
+        if iterations <= 0:
             return
         old_tau = np.inf
-        run_arguments = _eryn_accepted_kwargs(sampler.sample, dict(iterations=nsteps, progress=bool(settings['progress'])), 'EnsembleSampler.sample', essential=('iterations',))
-        for new_state in sampler.sample(state, **run_arguments):
-            cold_new.append(np.array(new_state.branches_coords[ERYN_BRANCH])[0].reshape(nwalkers, ndim))
-            iteration = cold_old.shape[0] + len(cold_new)
+        run_arguments = {key: SAMPLER[key] for key in SAMPLE_ARGUMENTS}
+        for new_state in sampler.sample(state, iterations=iterations, **run_arguments):
+            # only temperature 0 is copied out of the state
+            cold_new[n_new] = np.asarray(new_state.branches_coords[ERYN_BRANCH])[0].reshape(nwalkers, ndim)
+            ln_like_new[n_new], ln_prior_new[n_new] = np.asarray(new_state.log_like)[0], np.asarray(new_state.log_prior)[0]
+            n_new += 1
+            iteration = cold_old.shape[0] + n_new
             # Only check convergence every check_interval steps
-            if iteration % int(settings['check_interval']):
+            if iteration % int(SAMPLER['check_interval']):
                 continue
-            tau = emcee.autocorr.integrated_time(np.concatenate([cold_old, np.array(cold_new)]), c=5, tol=0, quiet=True)
-            converged = np.all(tau * float(settings['tau_multiple']) < iteration)
-            converged &= np.all(np.abs(old_tau - tau) / tau < float(settings['tau_tolerance']))
+            series = cold_new[:n_new] if cold_old.shape[0] == 0 else np.concatenate([cold_old, cold_new[:n_new]])
+            tau = emcee.autocorr.integrated_time(series, c=5, tol=0, quiet=True)
+            converged = np.all(tau * float(SAMPLER['tau_multiple']) < iteration)
+            converged &= np.all(np.abs(old_tau - tau) / tau < float(SAMPLER['tau_tolerance']))
             if converged:
                 print(f"Converged at step {iteration}")
-                break  # if convergence reached before nsteps, stop running
+                break  # if convergence reached before iterations, stop running
             old_tau = tau
 
     _LM, _VERBOSE = likelihood_manager, verbose       # for ncpu 1 the function reads them in this process; workers get them from _init_worker
     print("Available cores: %i" % cpu_count())
     print("Running with %i cores" % ncpu)
-    if ncpu > 1 and nsteps > 0:
+    if ncpu > 1 and iterations > 0:
         # The likelihood manager is passed to the workers once, via the initializer
         with closing(Pool(processes=ncpu, initializer=_init_worker, initargs=(likelihood_manager, verbose))) as pool:
-            sampler = make_sampler(_ChunkOnePool(pool))
+            sampler = make_sampler(_ChunkOnePool(pool, SAMPLER['chunksize']))
             sample(sampler)
             pool.terminate()
     else:
         sampler = make_sampler(None)
         sample(sampler)
 
-    # What Eryn stored: (steps, temperatures, walkers, leaves, ndim); the layout is checked, because a wrong assumption would silently mix axes
-    stored = sampler.get_chain()
-    chain = np.asarray(stored[ERYN_BRANCH] if isinstance(stored, dict) else stored)
-    ln_like, ln_prior = np.asarray(sampler.get_log_like()), np.asarray(sampler.get_log_prior())
-    steps = chain.shape[0]
-    if chain.shape != (steps, ntemps, nwalkers, 1, ndim) or ln_like.shape != (steps, ntemps, nwalkers) or ln_prior.shape != (steps, ntemps, nwalkers):
-        raise RuntimeError(f"the arrays stored by Eryn do not have the layout run_eryn assumes: chain {chain.shape} (expected {(steps, ntemps, nwalkers, 1, ndim)}), "
-                           f"log_like {ln_like.shape} and log_prior {ln_prior.shape} (expected {(steps, ntemps, nwalkers)}). Installed Eryn: {getattr(eryn, '__version__', '?')}")
-    if cold_new and not np.allclose(chain[cold_old.shape[0] + len(cold_new) - 1, 0, :, 0, :], cold_new[-1]):
-        raise RuntimeError("temperature index 0 of Eryn's chain is not the chain that was followed while sampling: the temperature axis is not as assumed")
+    # The result is the cold chain collected above (the old steps of a resumed run, then the new ones). What Eryn stored is checked against it without loading the chain
+    # of all temperatures: the number of steps, the layout, the temperature axis (temperature index 0 of the last stored step is the chain that was followed) and beta = 1
+    steps = cold_old.shape[0] + n_new
+    if steps == 0:
+        raise RuntimeError("no steps were taken or stored: run more steps")
+    shape = sampler.backend.shape
+    shape = tuple(shape[ERYN_BRANCH] if isinstance(shape, dict) else shape)
+    if sampler.iteration != steps or shape != (ntemps, nwalkers, 1, ndim):
+        raise RuntimeError(f"what Eryn stored does not match what run_eryn followed: {sampler.iteration} steps and layout {shape} (expected {steps} steps and {(ntemps, nwalkers, 1, ndim)}). "
+                           f"Installed Eryn: {getattr(eryn, '__version__', '?')}")
+    if n_new:
+        last = np.asarray(sampler.get_last_sample().branches_coords[ERYN_BRANCH])
+        if last.shape != (ntemps, nwalkers, 1, ndim) or not np.allclose(last[0, :, 0, :], cold_new[n_new - 1]):
+            raise RuntimeError("temperature index 0 of Eryn's last stored step is not the chain that was followed while sampling: the temperature axis is not as assumed")
     betas = np.asarray(sampler.get_betas()).reshape(-1, ntemps)
     if not np.isclose(betas[-1][0], 1.0):
         raise RuntimeError(f"temperature index 0 is not the cold chain (beta = {betas[-1][0]}): the temperature axis is not as assumed")
-    print(chain.shape)
 
     # the cold chain only, with the burn-in and thinning of run_emcee (and emcee's slice convention)
-    cold = chain[:, 0, :, 0, :]
-    ln_posterior_cold = ln_like[:, 0] + ln_prior[:, 0]
-    burnin, thin = eryn_burn_in_and_thin(cold)
+    cold = cold_new[:n_new] if cold_old.shape[0] == 0 else np.concatenate([cold_old, cold_new[:n_new]])
+    ln_posterior_cold = np.concatenate([ln_like_old + ln_prior_old, ln_like_new[:n_new] + ln_prior_new[:n_new]])
+    print(cold.shape)
+    burnin, thin = sampler_utils.eryn_burn_in_and_thin(cold)
     keep = slice(burnin + thin - 1, None, thin)
     samples = cold[keep].reshape(-1, ndim)
     ln_posterior = ln_posterior_cold[keep].reshape(-1)
