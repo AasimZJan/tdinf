@@ -17,7 +17,6 @@ except ImportError:
 import tdinf.utils as utils
 from tdinf.utils import sampler_utils
 
-    
 def create_run_sampler_arg_parser():
     """
     Parse arguments.  
@@ -30,7 +29,7 @@ def create_run_sampler_arg_parser():
     p.add_argument('--sampler-kwargs', default=None,
                    help='Settings of the sampler as a JSON string, e.g. \'{"nsamples": 2000, "ntemps": 6}\', or the path '
                         'of a JSON file. They are passed to the sampler as they are (true/false/null in JSON).')
-    p.add_argument('--use-physical-coordinates-for-sampling', action='store_true', help='Sampler samples the physical parameters')
+    p.add_argument('--use-physical-coordinates-for-sampling', action='store_true', help='Sampler will sample in the physical parameters.')
 
     # Where to save the output; the .dat file is written next to it
     p.add_argument('-o', '--output', '--output-h5', dest='output', required=True,
@@ -83,7 +82,7 @@ def create_run_sampler_arg_parser():
                    help='how to get reference parameter from reference posterior; '
                         'options = "tightest_time_posterior" or "maxL"')
 
-    # Start the sampler from an existing result
+    # Start the sampler from an existing result. Useful for emcee and eryn
     p.add_argument('--initial-walkers', default=None,
                    help='File or folder to start the sampler from: a tdinf posterior (.dat), the h5 backend of an emcee run '
                         '(its last sample), or a .npy file of positions in sampling coordinates. '
@@ -731,6 +730,11 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
         raise ImportError("--sampler bilby_mcmc needs bilby") from error
     import inspect
     import bilby
+    import warnings
+    for category in (FutureWarning, DeprecationWarning):
+        warnings.filterwarnings("ignore", category=category, module=r"bilby\.core\.likelihood")
+    os.environ["PYTHONWARNINGS"] = ",".join(filter(None, [os.environ.get("PYTHONWARNINGS"), "ignore::FutureWarning:bilby.core.likelihood",
+                                                          "ignore::DeprecationWarning:bilby.core.likelihood"]))
 
     # arguments
     outdir = os.path.dirname(args.output) or '.'
@@ -744,21 +748,21 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
         use_ratio=False,                 # True if log_likelihood() returns a log likelihood RATIO
         skip_import_verification=True,   # (True)
         check_point_plot=False,          # (True) make progress plots at every checkpoint; slow, so off here
-        diagnostic=True,                 # (False) extra deep-diagnostic plots for convergence problems
+        diagnostic=False,                 # (False) extra deep-diagnostic plots for convergence problems
         resume=bool(args.resume),        # (True) resume from checkpoint files found in outdir
         exit_code=130,                   # (130) exit code used when the run is interrupted
         verbose=True,                    # (True) print progress
         npool=1,                         # processes sharing the chains; choose a divisor of the number of chains
     )
 
-    # Sampler arguments (this is Bilby_MCMC.default_kwargs
+    # Sampler arguments
     SAMPLER = dict(
-        # --- how many samples, burn-in and thinning
-        nsamples=1000,                   # (1000) number of samples to draw
+        # how many samples, burn-in and thinning
+        nsamples=10000,                  # (1000) number of samples to draw
         burn_in_nact=10,                 # (10) autocorrelation times (ACTs) discarded as burn-in
-        thin_by_nact=1,                  # (1) thinning factor in ACTs; below 1 keeps correlated samples
+        thin_by_nact=0.2,                # (1) thinning factor in ACTs; below 1 keeps correlated samples
         fixed_discard=0,                 # (0) steps discarded in addition to the burn-in
-        # --- the chains
+        # chains
         nensemble=1,                     # (1) ensemble chains run with periodic communication
         ntemps=1,                        # (1) parallel-tempered chains
         pt_ensemble=False,               # (False) True: a tempered set per ensemble chain (nensemble x ntemps chains)
@@ -769,27 +773,27 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
         adapt_t0=100,                    # (100) adaptation time-lag
         adapt_nu=10,                     # (10) adaptation rate
         pt_rejection_sample=False,       # (False) rejection-sample the tempered chains when drawing samples
-        # --- steps and convergence
+        # steps and convergence
         L1steps=100,                     # (100) internal steps per iteration; the ACT is counted in iterations
-        L2steps=3,                       # (3) iterations between swaps of the tempered and ensemble chains
+        L2steps=1,                       # (3) iterations between swaps of the tempered and ensemble chains
         autocorr_c=5,                    # (5) minimum number of ACTs needed to trust the ACT estimate
         min_tau=1,                       # (1) smallest ACT accepted; can be used to force a larger one
         fixed_tau=None,                  # (None) a fixed ACT instead of an estimated one (see docstring)
         tau_window=None,                 # (None) window used for the ACT estimate (see docstring)
         stop_after_convergence=False,    # (False) with tempering: stop updating the chains once they have converged
-        # --- proposals
-        proposal_cycle="default",        # ("default") built-in cycle, or a ProposalCycle object
-        # --- evidence (only meaningful with ntemps > 1)
+        # proposals
+        proposal_cycle="tdinf_gw_nospinFMnoGMnoKD", # ("default") tdinf_gw is a custom cycle, similar to bilby's gw proposal cycles. nospinFM removes FM proposal for spin block as it was expensive (50% more ms/ev), KD and GM proposals were useless in the test cases.
+        # evidence (only meaningful with ntemps > 1)
         evidence_method="stepping_stone",  # ("stepping_stone") see docstring for the alternatives
-        # --- the starting point
+        # the starting point
         initial_sample_method="prior",   # ("prior") how the starting point is drawn (see docstring for the other methods)
         initial_sample_dict=None,        # (None) a dict of parameter values that overrides the drawn starting point; may be partial
-        # --- printing and checkpoints
-        printdt=1800,                       # (60) seconds between progress prints AND between convergence checks
+        # printing and checkpoints
+        printdt=300,                     # (60) seconds between progress prints AND between convergence checks
         check_point_delta_t=1800,        # (1800) seconds between checkpoints
         # tdinf arguments for bilby_mcmc
-        tdinf_fix_swaps=True,
-        tdinf_light_chains=True,
+        tdinf_fix_swaps=True,            # tdinf setting to ensure temperature swaps happen within bilby_mcmc
+        tdinf_light_chains=True,         # tdinf setting that sends each chain to the pool workers without its unused empty rows. Saves time. 
     )
 
     # Apply user-specified sampler kwargs
@@ -842,7 +846,6 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
 
     print(f"\nbilby_mcmc {bilby.__version__}: {len(prior_dict)} parameters in {'physical' if physical else 'sampling'} coordinates, "
           f"{bilby_number_of_chains(SAMPLER)} chains, outdir={outdir}, label={label}")
-    print("use_lvk_mass_and_time_prior:", args.use_lvk_mass_and_time_prior, "| only_prior:", likelihood_manager.only_prior)
 
     # avoid oversubscribing the cores with BLAS / OpenMP threads in the workers (as the emcee code did)
     if CONSTRUCTOR['npool'] > 1:
