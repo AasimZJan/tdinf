@@ -990,7 +990,7 @@ def _eryn_prior_class():
     except ImportError:
         base = object
 
-    class TdinfPrior(base):
+    class TdinfPrior():
         def __init__(self, likelihood_manager):
             self._lm = likelihood_manager
             for name, value in (('ndim', likelihood_manager.num_parameters), ('use_cupy', False), ('return_gpu', False), ('xp', np), ('priors_in', {}), ('priors', [])):
@@ -1026,6 +1026,8 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
         from eryn.backends import HDFBackend
     except ImportError as error:
         raise ImportError("--sampler eryn needs eryn (pip install eryn)") from error
+    if not hasattr(np, 'in1d'):
+        np.in1d = lambda ar1, ar2, assume_unique=False, invert=False, **kwargs: np.isin(np.ravel(ar1), ar2, assume_unique=assume_unique, invert=invert, **kwargs)
     global _LM, _VERBOSE
 
     # where Eryn saves its output while the sampler runs
@@ -1040,7 +1042,7 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
         nwalkers=128,                    # walkers PER TEMPERATURE
         ndims=ndim,                      # dimensions of each branch: an int, a list or a dict (required); tdinf: one branch with all the sampled parameters
         log_like_fn=_eryn_log_like,      # log LIKELIHOOD; Eryn tempers only this, the prior is separate
-        priors={ERYN_BRANCH: _eryn_prior_class()(likelihood_manager)},  # prior with a logpdf method
+        priors={ERYN_BRANCH: {tuple(range(ndim)): _eryn_prior_class()(likelihood_manager)}},  # {branch: {parameter indices: object with logpdf}}; Eryn builds its own prior container from it 
         branch_names=[ERYN_BRANCH],      # (None) names of the branches (models); None gives model_0, model_1, ...
         nbranches=1,                     # (1) number of branches; only used if branch_names is None
         nleaves_max=1,                   # (1) maximum leaves (sources) per branch; 1 is a plain fixed-dimension model
