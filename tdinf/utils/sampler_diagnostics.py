@@ -1,17 +1,75 @@
+#!/usr/bin/env python3
 """
-emcee_diagnostics: exploration and convergence diagnostics for emcee output,
+sampler_diagnostics: the HTML diagnostics of a tdinf run, for whichever sampler made it, in ONE file (it needs only numpy, scipy, matplotlib and h5py).
+
+    from tdinf.utils import sampler_diagnostics
+    sampler_diagnostics.run(args.sampler, args, kwargs=kwargs, sampler_kwargs=sampler_kwargs)       # run_sampler.py does exactly this in main(), with --produce-diagnostics
+
+It takes the name of the sampler and what the sampler was given (run_sampler's args, kwargs and sampler_kwargs, from which the files it wrote are found) and writes one
+self-contained HTML report next to the output, <--output without extension>_diagnostics.html. What it does depends on the sampler:
+
+  emcee        log-probability, burn-in, walkers, traces, autocorrelation, R-hat, ESS (PART 1 below: the module that used to be emcee_diagnostics.py).
+  eryn         the same report for the COLD chain (temperature 0, its walkers being the walkers of the report), and a Tempering section with what only a tempered
+               ensemble has: the temperature ladder and whether it has settled, the swap acceptance of every adjacent pair (measured, and predicted from the stored
+               log likelihoods), the log likelihood of every temperature and how neighbours overlap, the acceptance of every move at every temperature, the
+               autocorrelation time of the POPULATION (see below) and the drift of every temperature. Its checks and verdict are part of the Overview (PART 3).
+  bilby_mcmc   the report from the resume pickle: chains, ladder, swaps, proposals, per-chain statistics (PART 2: the module that used to be bilby_diagnostics.py).
+Any other sampler gets a message and no report. Nothing here can stop a run: with safe=True (default) any error is printed as a warning.
+
+Why Eryn gets population numbers. Every step swaps the walkers of neighbouring temperatures, so a walker SLOT of the cold chain is refilled by a neighbour within a few steps
+and its autocorrelation time is only a few steps. The state of the whole ensemble can still move slowly: the share of walkers in a mode, the mean of a parameter. The Tempering
+section therefore also gives the autocorrelation time of the ensemble mean of every parameter at every temperature, and the shift of that mean between the two halves of the
+run. The run length divided by that time, not the per-slot time, says how many independent looks the run has at slow collective behaviour such as mode weights.
+
+Layout of this file. PART 1 is the emcee report; PART 2 the bilby_mcmc report (the 31 helpers it shares with PART 1 are the same code and are defined once, in PART 1; the 14 that
+differ carry a bilby_ prefix: bilby_analyze, bilby_build_report, bilby_report_from_args, ...); PART 3 the dispatcher run() and the Eryn analysis; the command line is at the end.
+The documentation of the two old modules is kept in _EMCEE_DOC and _BILBY_DOC (shown by their --help).
+
+From the shell:
+    python sampler_diagnostics.py emcee      -o run.h5 --vary-skypos --vary-time        (the old emcee_diagnostics command line; emcee --help for the rest)
+    python sampler_diagnostics.py eryn       run.h5 --vary-skypos --vary-time          (eryn --help)
+    python sampler_diagnostics.py bilby_mcmc run_resume.pickle [--posterior-widths] [--swaps-only] ...     (bilby_mcmc --help)
+"""
+
+import argparse
+import base64
+import collections
+import copy
+import html as _html
+import io
+import itertools
+import json
+import os
+import pickle
+import re
+import sys
+import time
+from contextlib import contextmanager
+
+import numpy as np
+from scipy.special import ndtri
+from scipy.stats import binom, rankdata
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
+
+_EMCEE_DOC = """
+emcee diagnostics (PART 1 of sampler_diagnostics.py): exploration and convergence diagnostics for emcee output,
 with a self-contained HTML report. One file: it needs only numpy, scipy,
 matplotlib (and h5py to read files).
 
 Defaults: NO thinning and NO burn-in. Everything is computed on the chain exactly
 as it is in the file. The estimated burn-in is shown (dashed line, Burn-in section)
-and the Burn-in section shows how N/tau and drift change as steps are
+and the Burn-in section shows how R-hat, N/tau and drift change as steps are
 discarded, but nothing is discarded unless you ask (burn=... / thin=...).
 
 With run_sampler.py
 -------------------
-    at the end of main():   from tdinf import emcee_diagnostics as ed; ed.report_from_args(args, kwargs=kwargs)
-    or from the shell:      python emcee_diagnostics.py -o full/full.h5 --vary-skypos --vary-time   (run_sampler's own flags)
+    at the end of main():   from tdinf.utils import sampler_diagnostics; sampler_diagnostics.run(args.sampler, args, kwargs=kwargs)
+    or from the shell:      python sampler_diagnostics.py emcee -o full/full.h5 --vary-skypos --vary-time   (run_sampler's own flags)
 
 Reading
 -------
@@ -27,7 +85,7 @@ What is checked
 * walkers: fraction of steps moved, longest frozen run, low-lnp outliers,
   parameter offsets relative to the other walkers;
 * convergence: integrated autocorrelation time (emcee-style) and N/tau, the
-  autocorrelation function itself, tau-based ESS,
+  autocorrelation function itself, tau-based ESS, rank-normalised split R-hat,
   half-vs-half drift, acceptance;
 * burn-in: estimated plateau start, and the statistics as a function of the
   number of steps discarded.
@@ -42,32 +100,53 @@ blocks, FFTs are done in walker blocks to bound memory, and plots draw at most
 ~1200 points per line. A very large run therefore costs time (minutes) rather
 than failing; if memory is tight use thin= (tau is scaled back by the stride).
 
-Caveat: walkers of an affine-invariant ensemble are not independent chains.
-N > 50 tau is the primary criterion.
+Caveat: walkers of an affine-invariant ensemble are not independent chains, so
+R-hat across walkers is a heuristic. N > 50 tau is the primary criterion.
 """
-import argparse
-import base64
-import html as _html
-import io
-import itertools
-import json
-import os
-import re
-import sys
-import time
-from contextlib import contextmanager
 
-import numpy as np
-from scipy.stats import binom
+_BILBY_DOC = """
+bilby_mcmc diagnostics (PART 2 of sampler_diagnostics.py): exploration and convergence diagnostics for a bilby_mcmc run (parallel tempering), read from its resume pickle <label>_resume.pickle,
+as one self-contained HTML report. It is the bilby counterpart of the emcee report (tdinf/utils/sampler_diagnostics.py) and looks and reads the same way:
+an Overview with a verdict, cards, a plain-language reading of the run, what to try and a table of checks, then Settings, Log-likelihood, Temperatures, Burn-in,
+Chains, Proposals, Traces (with the same interactive explorer), Convergence, Posteriors and Methods. It needs only numpy, scipy and matplotlib: the pickle is read with a
+restricted unpickler, WITHOUT bilby or dill, and nothing in the file is run (a normal dill.load runs whatever the file says).
 
-import matplotlib
+From the shell
+--------------
+    python sampler_diagnostics.py bilby_mcmc output-trial-v0_resume.pickle                      # writes output-trial-v0_resume_diagnostics.html next to it
+    python sampler_diagnostics.py bilby_mcmc run_resume.pickle -o report.html --burn estimated  # --burn: bilby (default), estimated, <rows> or <fraction>
+    python sampler_diagnostics.py bilby_mcmc run_resume.pickle --posterior-widths               # just the JSON for "tdinf_posterior_width"
+    python sampler_diagnostics.py bilby_mcmc run_resume.pickle --swaps-only                     # just the swap test
+    python sampler_diagnostics.py bilby_mcmc old_resume.pickle --drop-rows-mod 4:1              # an old run whose swaps rewrote rows (see Temperatures)
+
+With run_sampler.py (the same as --produce-diagnostics for emcee)
+-----------------------------------------------------------------
+    at the end of run_bilby_mcmc():   from tdinf.utils import sampler_diagnostics; sampler_diagnostics.run("bilby_mcmc", args, sampler_kwargs=sampler_kwargs)
+    (never raises: a problem in the report is printed as a warning and cannot break the run)
+
+What is checked
+---------------
+* swaps: acceptance of every pair (recorded and predicted from the stored ln L), evenness of the ladder, a more even ladder, the replica round trip by simulation, and whether
+  the swaps move the chains (the cold chain's rows that jump, and whether the next row returns);
+* convergence of the cold chains: integrated autocorrelation time tau (emcee style, also per chain) and N/tau, the autocorrelation function, ESS, rank-normalised split R-hat,
+  half-vs-half drift, tau against chain length, tau of every parameter at every temperature, and the slowest direction of the posterior;
+* burn-in: bilby's own cut and the rule that set it, the ln L plateau, and the statistics as a function of the rows removed;
+* chains: ln L, tau, offsets of the means in standard errors, bilby's local acceptance;
+* proposals: acceptance of every proposal at every temperature, the size of the adaptive Gaussian steps against the posterior widths, and the share of differential-evolution
+  jumps that leave the prior (and so are rejected before the likelihood);
+* bilby's own count of samples against the target, and a corrected estimate of the time to finish.
+
+Caveat: the cold chains of an ensemble are not independent runs, so R-hat between them is a heuristic. N > 50 tau is the primary criterion.
+"""
+
+
+# ==============================================================================================================================================
+# PART 1: emcee (what used to be emcee_diagnostics.py, with the extras hook)
+# ==============================================================================================================================================
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt                        # noqa: E402
-from matplotlib.gridspec import GridSpec               # noqa: E402
-from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator   # noqa: E402
 
 __all__ = ["Run", "read_emcee_h5", "analyze", "build_report", "get_layout", "candidate_layouts", "detect_layout", "TDINF_DEFAULT_BOUNDS", "FLAG_RULES_VERSION",
-           "decode_samples", "integrated_autocorr_time", "mean_acf",
+           "decode_samples", "integrated_autocorr_time", "mean_acf", "split_rhat", "rhat_bulk_tail",
            "estimate_burnin", "burn_scan", "report_from_args", "infer_layout_from_file"]
 
 # ============================================================================== style
@@ -97,27 +176,22 @@ def _style():
 
 # ============================================================================== tdinf layout and decoding
 
-def get_layout(spin_model, vary_skypos, vary_time, eccentric=False):
+def get_layout(spin_model, vary_skypos, vary_time):
     """
     Names of the columns of a tdinf emcee chain, in order (identical to tdinf's `sampled_keys`).
     Logistic-transformed parameters carry the prefix x_; angles are stored as (x, y) pairs;
     c1_*, c2_* are spin direction vectors.
 
-    spin_model : 'precessing', 'aligned' or 'none';  vary_skypos, vary_time, eccentric : bool
-    (eccentric: the run sampled eccentricity and mean anomaly, i.e. run_sampler's --eccentric-analysis)
+    spin_model : 'precessing', 'aligned' or 'none';  vary_skypos, vary_time : bool
     """
     if spin_model not in ("precessing", "aligned", "none"):
         raise ValueError("spin_model must be 'precessing', 'aligned' or 'none'")
     keys = ["x_total_mass", "x_mass_ratio", "x_luminosity_distance", "x_cos_inclination"]
     if spin_model != "none":
         keys += ["x_spin1_magnitude", "x_spin2_magnitude"]
-    if eccentric:
-        keys += ["x_eccentricity"]
     if vary_skypos:
         keys += ["x_sin_declination"]
     keys += ["phase_x", "phase_y"]
-    if eccentric:
-        keys += ["mean_anomaly_x", "mean_anomaly_y"]
     if vary_skypos:
         keys += ["right_ascension_x", "right_ascension_y", "polarization_x", "polarization_y"]
     if spin_model == "precessing":
@@ -130,23 +204,23 @@ def get_layout(spin_model, vary_skypos, vary_time, eccentric=False):
 
 
 def candidate_layouts(ndim):
-    """All (spin_model, vary_skypos, vary_time, eccentric) configurations that give `ndim` columns."""
+    """All (spin_model, vary_skypos, vary_time) configurations that give `ndim` columns."""
     out = []
-    for spin_model, sky, time_, ecc in itertools.product(("precessing", "aligned", "none"), (False, True), (False, True), (False, True)):
-        if len(get_layout(spin_model, sky, time_, ecc)) == ndim:
-            out.append(dict(spin_model=spin_model, vary_skypos=sky, vary_time=time_, eccentric=ecc))
+    for spin_model, sky, time_ in itertools.product(("precessing", "aligned", "none"), (False, True), (False, True)):
+        if len(get_layout(spin_model, sky, time_)) == ndim:
+            out.append(dict(spin_model=spin_model, vary_skypos=sky, vary_time=time_))
     return out
 
 
 # Prior bounds that tdinf's run_sampler uses unless the command line changes them. They are NOT stored in the h5 file.
-TDINF_DEFAULT_BOUNDS = dict(mtot_lim=(200, 350), q_lim=(0.17, 1), dist_lim=(100, 10000), chi_lim=(0, 0.99), ecc_lim=(0.0, 0.4))
+TDINF_DEFAULT_BOUNDS = dict(mtot_lim=(200, 350), q_lim=(0.17, 1), dist_lim=(100, 10000), chi_lim=(0, 0.99))
 
 
 def detect_layout(names):
-    """If `names` is a tdinf column layout, return dict(spin_model, vary_skypos, vary_time, eccentric); otherwise None."""
-    for spin_model, sky, time_, ecc in itertools.product(("precessing", "aligned", "none"), (False, True), (False, True), (False, True)):
-        if list(names) == get_layout(spin_model, sky, time_, ecc):
-            return dict(spin_model=spin_model, vary_skypos=sky, vary_time=time_, eccentric=ecc)
+    """If `names` is a tdinf column layout, return dict(spin_model, vary_skypos, vary_time); otherwise None."""
+    for spin_model, sky, time_ in itertools.product(("precessing", "aligned", "none"), (False, True), (False, True)):
+        if list(names) == get_layout(spin_model, sky, time_):
+            return dict(spin_model=spin_model, vary_skypos=sky, vary_time=time_)
     return None
 
 
@@ -159,23 +233,22 @@ def _inv_logit(y, lo, hi):
 
 
 def decode_samples(chain, spin_model, vary_skypos, vary_time, mtot_lim, q_lim, dist_lim, chi_lim,
-                   fixed=None, f_ref=None, check_layout=True, eccentric=False, ecc_lim=(0.0, 0.4)):
+                   fixed=None, f_ref=None, check_layout=True):
     """
     Convert sampled numbers (last axis = columns of get_layout) into physical parameters.
 
     mtot_lim, q_lim, dist_lim, chi_lim : (low, high) prior bounds of the run (from its command line).
-    eccentric, ecc_lim : the run sampled eccentricity and mean anomaly (--eccentric-analysis) and the eccentricity bounds.
     fixed : values of parameters that were not sampled: 'right_ascension', 'declination', 'polarization'
             (if not vary_skypos) and 'geocenter_time' (if not vary_time).
     f_ref : if given and lalsimulation is installed, theta_jn, phi_jl, tilt1, tilt2, phi12 come from LAL;
             otherwise tilt1, tilt2, phi12 are computed analytically and theta_jn, phi_jl are omitted.
     Returns a dict of arrays with the shape of chain[..., 0].
     Conventions are those of tdinf: logistic x = lo + (hi - lo) * sigmoid(y); inclination = arccos(...),
-    declination = arcsin(...); angles = arctan2(y, x) (+ pi for right_ascension and mean_anomaly); spin = magnitude * c / |c|.
+    declination = arcsin(...); angles = arctan2(y, x) (+ pi for right_ascension); spin = magnitude * c / |c|.
     """
     fixed = {} if fixed is None else fixed
     chain = np.asarray(chain, dtype=float)
-    keys = get_layout(spin_model, vary_skypos, vary_time, eccentric)
+    keys = get_layout(spin_model, vary_skypos, vary_time)
     if chain.shape[-1] != len(keys):
         raise ValueError(f"chain has {chain.shape[-1]} columns but this configuration has {len(keys)}: {keys}. "
                          f"Configurations with {chain.shape[-1]} columns: {candidate_layouts(chain.shape[-1])}")
@@ -193,9 +266,6 @@ def decode_samples(chain, spin_model, vary_skypos, vary_time, mtot_lim, q_lim, d
     out["luminosity_distance"] = _inv_logit(col["x_luminosity_distance"], *dist_lim)
     out["inclination"] = np.arccos(_inv_logit(col["x_cos_inclination"], -1.0, 1.0))
     out["phase"] = np.arctan2(col["phase_y"], col["phase_x"])
-    if eccentric:
-        out["eccentricity"] = _inv_logit(col["x_eccentricity"], *ecc_lim)
-        out["mean_anomaly"] = np.arctan2(col["mean_anomaly_y"], col["mean_anomaly_x"]) + np.pi
     out["mass_1"] = out["total_mass"] / (1.0 + out["mass_ratio"])
     out["mass_2"] = out["total_mass"] - out["mass_1"]
     out["chirp_mass"] = (out["mass_1"] * out["mass_2"]) ** 0.6 / out["total_mass"] ** 0.2
@@ -273,7 +343,7 @@ def _spin_angles(p, f_ref):
 
 _PHYSICAL_KEYS = ["total_mass", "mass_ratio", "mass_1", "mass_2", "chirp_mass", "luminosity_distance", "inclination", "phase",
                   "spin1_magnitude", "spin2_magnitude", "chi_eff", "chi_p", "tilt1", "tilt2", "phi12", "right_ascension",
-                  "declination", "polarization", "eccentricity", "mean_anomaly"]
+                  "declination", "polarization"]
 
 
 # ============================================================================== data container
@@ -379,7 +449,7 @@ class Run:
             self.derived_names.append(k)
 
     def add_physical(self, spin_model, vary_skypos, vary_time, mtot_lim, q_lim, dist_lim, chi_lim,
-                     fixed=None, keys=None, block=2000, eccentric=False, ecc_lim=(0.0, 0.4)):
+                     fixed=None, keys=None, block=2000):
         """
         Add physical parameters decoded from the sampled numbers (tdinf layout), computed in blocks of
         `block` steps so that memory stays bounded. `keys` defaults to masses (including the chirp mass), distance,
@@ -387,7 +457,7 @@ class Run:
         Every column needs steps x walkers x 4 bytes of memory; pass `keys` to limit them on very large runs.
         """
         self.physical_info = dict(mtot_lim=tuple(mtot_lim), q_lim=tuple(q_lim), dist_lim=tuple(dist_lim), chi_lim=tuple(chi_lim),
-                                  ecc_lim=tuple(ecc_lim), eccentric=bool(eccentric), fixed=dict(fixed or {}), auto=False)
+                                  fixed=dict(fixed or {}), auto=False)
         want = list(keys) if keys else [k for k in _PHYSICAL_KEYS
                                          if vary_skypos or k not in ("right_ascension", "declination", "polarization")]
         want = [k for k in want if not (spin_model == "none" and k in ("spin1_magnitude", "spin2_magnitude", "chi_eff", "chi_p", "tilt1", "tilt2", "phi12"))]
@@ -395,7 +465,7 @@ class Run:
         for b0 in range(0, self.n, block):
             blk = self.x[b0:b0 + block].astype(np.float64) + self.offsets      # true values, offsets added back
             dec = decode_samples(blk, spin_model, vary_skypos, vary_time, mtot_lim, q_lim,
-                                 dist_lim, chi_lim, fixed=fixed, check_layout=(b0 == 0), eccentric=eccentric, ecc_lim=ecc_lim)
+                                 dist_lim, chi_lim, fixed=fixed, check_layout=(b0 == 0))
             for k in want:
                 if k in dec:
                     out.setdefault(k, np.empty((self.n, self.nwalkers), dtype=np.float32))[b0:b0 + block] = dec[k]
@@ -550,6 +620,32 @@ def integrated_autocorr_time(x, c=5.0):
     return float(taus[auto_window(taus, c)])
 
 
+def _rank_normalize(x):
+    r = rankdata(x.ravel(), method="average").reshape(x.shape)
+    return ndtri((r - 0.375) / (x.size + 0.25))
+
+
+def split_rhat(x):
+    """Split R-hat for x (n, nchains): every chain is cut in two halves."""
+    n = x.shape[0] // 2
+    if n < 4 or x.shape[1] < 2:
+        return np.nan
+    ch = np.concatenate([x[:n], x[n:2 * n]], axis=1)
+    W = ch.var(axis=0, ddof=1).mean()
+    if W <= 0:
+        return np.nan
+    B = n * ch.mean(axis=0).var(ddof=1)
+    return float(np.sqrt(((n - 1) / n * W + B / n) / W))
+
+
+def rhat_bulk_tail(x):
+    """Rank-normalised split R-hat (Vehtari et al. 2021): returns (bulk, tail)."""
+    x = np.asarray(x, dtype=np.float64)
+    bulk = split_rhat(_rank_normalize(x))
+    tail = split_rhat(_rank_normalize(np.abs(x - np.median(x))))
+    return bulk, tail
+
+
 def drift_z(x, tau):
     """Difference of the means of the two halves, in standard errors (tau gives the effective sample size)."""
     n, w = x.shape
@@ -654,9 +750,9 @@ def burn_scan(run, an, fractions=(0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5), ma
               tau_c=5.0, seed=0):
     """
     How the convergence statistics change when the first part of the chain is discarded.
-    For each fraction, N/tau and drift are computed on what is left. For speed this scan uses at most
+    For each fraction, R-hat, N/tau and drift are computed on what is left. For speed this scan uses at most
     `max_rows` evenly spaced steps and `max_walkers` unflagged walkers (N/tau is unaffected by thinning).
-    Returns a dict of arrays: step (steps discarded), frac, n_over_tau (min), drift (max |z|), plateau.
+    Returns a dict of arrays: step (steps discarded), frac, rhat (max), n_over_tau (min), drift (max |z|), plateau.
     """
     rng = np.random.default_rng(seed)
     keep = np.nonzero(_keep_mask(an))[0]
@@ -665,19 +761,22 @@ def burn_scan(run, an, fractions=(0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5), ma
     rows = np.arange(0, run.n, sstride)
     cols = {nm: _fill_nan(run.columns[nm][rows][:, walkers]) for nm in run.names}
     lnp_s = run.lnp[rows][:, walkers]
-    out = {k: [] for k in ("step", "frac", "n_over_tau", "drift", "plateau")}
+    out = {k: [] for k in ("step", "frac", "rhat", "n_over_tau", "drift", "plateau")}
     for f in fractions:
         b = int(round(f * len(rows)))
         if len(rows) - b < 60:
             continue
-        no, dz = [], []
+        rh, no, dz = [], [], []
         for nm in run.names:
             x = cols[nm][b:]
             tau = integrated_autocorr_time(x, tau_c)
+            rb, rt = rhat_bulk_tail(x)
+            rh.append(np.nanmax([rb, rt]) if np.isfinite([rb, rt]).any() else np.nan)
             no.append(x.shape[0] / tau if np.isfinite(tau) and tau > 0 else np.nan)
             dz.append(abs(drift_z(x, tau)))
         out["step"].append(int(run.steps[rows[b]]))
         out["frac"].append(b / len(rows))
+        out["rhat"].append(np.nanmax(rh) if np.isfinite(rh).any() else np.nan)
         out["n_over_tau"].append(np.nanmin(no) if np.isfinite(no).any() else np.nan)
         out["drift"].append(np.nanmax(dz) if np.isfinite(dz).any() else np.nan)
         out["plateau"].append(float(np.nanmedian(lnp_s[b:])))
@@ -725,6 +824,10 @@ def _diagnose(an, run):
     elif short:
         v, nm = min(n_over)
         obs.append(f"The chain is {v:.1f} autocorrelation times long for {nm}; 50 or more is wanted before the statistics can be trusted.")
+    rh = [r_["rhat"] for r_ in rows if np.isfinite(r_["rhat"])]
+    rc = [r_["rhat_clean"] for r_ in rows if np.isfinite(r_["rhat_clean"])]
+    if rh and rc and max(rh) > 1.05 and max(rc) < 1.05:
+        obs.append(f"R-hat falls from {max(rh):.2f} to {max(rc):.2f} when the flagged walkers are left out, so they account for most of the disagreement between walkers.")
 
     # ---- what to try
     if short:
@@ -761,7 +864,7 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
     """
     Run all diagnostics. Returns a dict used by the plotting and report functions.
 
-    burn : what to DISCARD before computing tau, ESS and drift.
+    burn : what to DISCARD before computing tau, R-hat, ESS and drift.
            0 (default) = nothing; 'auto' = the estimated burn-in; a float in (0, 1) = that fraction of the
            steps; an int = that many steps (original step units).
     The estimated burn-in is always computed and shown, and it is also used to decide which part of the run
@@ -874,6 +977,8 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
     an["walkers"] = walkers
 
     # ---- per-parameter convergence statistics (on the chain minus the DISCARDED burn-in only)
+    clean = ~flagged
+    use_clean = flagged.any() and clean.sum() >= 4
     rows = []
     for j, nm in enumerate(names):
         if verbose:
@@ -881,19 +986,27 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
         x = _fill_nan(run.columns[nm][bi:])
         tau_thin = integrated_autocorr_time(x, tau_c)
         tau = tau_thin * run.stride
+        rb, rt = rhat_bulk_tail(x)
+        rhat = np.nanmax([rb, rt]) if np.isfinite([rb, rt]).any() else np.nan
+        if use_clean:
+            cb, ct = rhat_bulk_tail(x[:, clean])
+            rclean = np.nanmax([cb, ct]) if np.isfinite([cb, ct]).any() else np.nan
+        else:
+            rclean = np.nan
         ok_tau = np.isfinite(tau) and tau > 0
         n_over_tau = n_post_steps / tau if ok_tau else np.nan
         ess = w * n_post_steps / tau if ok_tau else np.nan
         dz = drift_z(x, tau_thin)
         q05, q50, q95 = np.percentile(x, [5, 50, 95])
         st_tau = _status(n_over_tau, 50, 20, higher_is_better=True)
+        st_rhat = _status(rhat, 1.01, 1.05)
         st_ess = _status(ess, ess_target, ess_target / 2.5, higher_is_better=True)
         st_drift = _status(abs(dz) if np.isfinite(dz) else np.nan, 3, 5)
         res = dict(name=nm, mean=float(x.mean()), std=float(x.std()), q05=float(q05), q50=float(q50), q95=float(q95),
-                   tau=tau, n_over_tau=n_over_tau, ess=ess,
-                   drift_z=dz, st_tau=st_tau, st_ess=st_ess, st_drift=st_drift,
+                   rhat_bulk=rb, rhat_tail=rt, rhat=rhat, rhat_clean=rclean, tau=tau, n_over_tau=n_over_tau, ess=ess,
+                   drift_z=dz, st_tau=st_tau, st_rhat=st_rhat, st_ess=st_ess, st_drift=st_drift,
                    tau_resolved=bool(np.isfinite(tau_thin) and tau_thin >= 3), derived=nm in run.derived_names)
-        res["status"] = _worst(st_tau, st_ess, st_drift)
+        res["status"] = _worst(st_tau, st_rhat, st_ess, st_drift)
         rows.append(res)
     an["params"] = rows
 
@@ -913,6 +1026,7 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
 
     # ---- overall checks
     n_over = np.array([r["n_over_tau"] for r in rows], dtype=float)
+    rh = np.array([r["rhat"] for r in rows], dtype=float)
     ess_arr = np.array([r["ess"] for r in rows], dtype=float)
     dz_arr = np.abs(np.array([r["drift_z"] for r in rows], dtype=float))
     acc_med = float(np.nanmedian(accept))
@@ -920,7 +1034,7 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
     def pick(arr, fn):
         return int(fn(arr)) if np.isfinite(arr).any() else 0
 
-    wn, we, wd = pick(n_over, np.nanargmin), pick(ess_arr, np.nanargmin), pick(dz_arr, np.nanargmax)
+    wn, wr, we, wd = pick(n_over, np.nanargmin), pick(rh, np.nanargmax), pick(ess_arr, np.nanargmin), pick(dz_arr, np.nanargmax)
     pct = 100.0 * an["est_step"] / max(run.steps[-1] + 1, 1)
     plateau_txt = (f"plateau from step {an['est_step']:,} ({pct:.0f}% of the run)" + (f"; the first {an['burn_step']:,} steps are removed" if bi > 0 else "")
                    if est_found else "no plateau found")
@@ -933,6 +1047,8 @@ def analyze(run, burn=0, tau_c=5.0, curve_points=10, curve_walkers=128, scan=Tru
     checks = [
         ("tau", "Chain length vs autocorrelation time", _status(np.nanmin(n_over), 50, 20, True),
          f"min N/tau = {np.nanmin(n_over):.1f} ({names[wn]})", "Good if the chain is at least 50 autocorrelation times long; check from 20; problem below 20."),
+        ("rhat", "Rank-normalised split R-hat", _status(np.nanmax(rh), 1.01, 1.05),
+         f"max R-hat = {np.nanmax(rh):.3f} ({names[wr]})", "Good below 1.01; check up to 1.05; problem above 1.05."),
         ("ess", "Effective sample size", _status(np.nanmin(ess_arr), ess_target, ess_target / 2.5, True),
          f"min ESS = {np.nanmin(ess_arr):.0f} ({names[we]})", f"Good at {ess_target} or more independent samples; check from {ess_target / 2.5:.0f}; problem below that."),
         ("drift", "Half-vs-half drift of the means", _status(np.nanmax(dz_arr), 3, 5),
@@ -1247,7 +1363,10 @@ def plot_traces(run, an, params=None, per_page=5, max_pts=1200):
                 _offscale(at, an, fl_vals, "walker {i}: {v:.4g}")
                 at.set_ylabel(nm, fontsize=10)
                 info = prm[nm]
-                txt = f"tau={_fmt(info['tau'])}   N/tau={_fmt(info['n_over_tau'])}   ESS={_fmt(info['ess'])}"
+                txt = f"tau={_fmt(info['tau'])}   N/tau={_fmt(info['n_over_tau'])}   R-hat={_fmt(info['rhat'])}"
+                if np.isfinite(info["rhat_clean"]):
+                    txt += f" (without flagged: {_fmt(info['rhat_clean'])})"
+                txt += f"   ESS={_fmt(info['ess'])}"
                 at.text(0.01, 0.97, txt, transform=at.transAxes, va="top", fontsize=8,
                         color={"ok": C["green"], "warn": C["amber"], "bad": C["red"], "na": C["gray"]}[info["status"]],
                         bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.5))
@@ -1303,15 +1422,21 @@ def plot_autocorr(an):
     return fig
 
 
-def plot_tau_ess(an):
-    """N/tau and ESS for every parameter, coloured by status."""
+def plot_rhat_ess(an):
+    """R-hat and ESS for every parameter, coloured by status."""
     rows = an["params"]
     names = [r["name"] for r in rows]
     cols = {"ok": C["green"], "warn": C["amber"], "bad": C["red"], "na": C["gray"]}
     with _style():
         h = max(3.2, 0.28 * len(rows) + 1.2)
-        fig, (a2, a3) = plt.subplots(1, 2, figsize=(11, h), sharey=True)
+        fig, (a1, a2, a3) = plt.subplots(1, 3, figsize=(11, h), sharey=True)
         y = np.arange(len(rows))
+        rh = np.array([r["rhat"] for r in rows], dtype=float)
+        a1.barh(y, np.nan_to_num(rh - 1, nan=0), left=1, color=[cols[r["st_rhat"]] for r in rows])
+        a1.axvline(1.01, color=C["ink"], ls=":", lw=1)
+        a1.axvline(1.05, color=C["ink"], ls="--", lw=1)
+        a1.set_xlim(0.99, max(1.08, np.nanmax(rh) * 1.01 if np.isfinite(rh).any() else 1.08))
+        a1.set_title("rank-normalised split R-hat", loc="left", fontsize=10)
         no = np.array([r["n_over_tau"] for r in rows], dtype=float)
         a2.barh(y, np.nan_to_num(no, nan=0), color=[cols[r["st_tau"]] for r in rows])
         a2.axvline(50, color=C["ink"], ls="--", lw=1)
@@ -1319,9 +1444,9 @@ def plot_tau_ess(an):
         es = np.array([r["ess"] for r in rows], dtype=float)
         a3.barh(y, np.nan_to_num(es, nan=0), color=[cols[r["st_ess"]] for r in rows])
         a3.set_title("effective sample size", loc="left", fontsize=10)
-        a2.set_yticks(y)
-        a2.set_yticklabels(names)
-        a2.invert_yaxis()
+        a1.set_yticks(y)
+        a1.set_yticklabels(names)
+        a1.invert_yaxis()
         fig.tight_layout()
     return fig
 
@@ -1395,13 +1520,13 @@ def plot_flagged(run, an, max_walkers=6):
 def plot_burnin(run, an):
     """
     Top: ln p relative to the late-run plateau against log(step), so the climb is visible whatever its length.
-    Bottom: what N/tau and drift would be if the first part of the run were discarded.
+    Bottom: what R-hat, N/tau and drift would be if the first part of the run were discarded.
     Purple dashed = estimated burn-in; the green shading marks the good region of each statistic.
     """
     sc = an.get("burn_scan")
     with _style():
         fig = plt.figure(figsize=(11, 7.4))
-        gs = GridSpec(2, 2, height_ratios=[1.3, 1], hspace=0.45, wspace=0.28, figure=fig,
+        gs = GridSpec(2, 3, height_ratios=[1.3, 1], hspace=0.45, wspace=0.32, figure=fig,
                       left=0.07, right=0.98, top=0.95, bottom=0.08)
         ax = fig.add_subplot(gs[0, :])
         n = run.n
@@ -1441,7 +1566,8 @@ def plot_burnin(run, an):
         ax.set_title("Approach to the plateau", loc="left")
         ax.legend(ncol=2, loc="upper left")
         if sc is not None and len(sc["step"]) > 1:
-            panels = [("N / tau, worst parameter", sc["n_over_tau"], 50, 20, True, True, "50: good above", "20: problem below"),
+            panels = [("R-hat, worst parameter", sc["rhat"], 1.01, 1.05, False, False, "1.01: good below", "1.05: problem above"),
+                      ("N / tau, worst parameter", sc["n_over_tau"], 50, 20, True, True, "50: good above", "20: problem below"),
                       ("|drift z|, worst parameter", sc["drift"], 3, 5, False, False, "3: good below", "5: problem above")]
             for k, (ttl, y, good, bad, higher, logy, glab, blab) in enumerate(panels):
                 a = fig.add_subplot(gs[1, k])
@@ -1683,15 +1809,8 @@ img{max-width:100%;height:auto;background:#fff;border-radius:8px;border:1px soli
 #ex-canvas,#lp-canvas,#pd-hist,#pd-cat,#hh-canvas,#fw-canvas{width:100%;display:block;background:#fff;border-radius:8px} #fw-canvas{height:360px}
 .controls button{padding:3px 12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);cursor:pointer} #ex-canvas{height:380px} #lp-canvas{height:430px} #pd-hist,#pd-cat{height:380px} #hh-canvas{height:340px}
 #hh-stats table{width:auto;font-size:12.5px;margin-top:8px} #hh-stats th{cursor:default}
-.argcols{columns:2 400px;column-gap:12px;margin-top:8px}
-.argcard{break-inside:avoid;border:1px solid var(--line);border-radius:10px;padding:7px 10px 8px;margin:0 0 10px}
-.argcard h4{margin:0 0 3px;font-size:13px}
-table.argc{table-layout:auto;width:100%;font-size:12.5px}
-table.argc td{padding:2px 8px 2px 0;white-space:normal;text-align:left;vertical-align:top;line-height:1.35}
-table.argc td:first-child{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:nowrap;color:var(--muted);width:1%}
-table.argc .line{overflow-wrap:anywhere} table.argc .line.path{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:290px}
-.argcard .unset{margin:4px 0 0;font-size:12px;color:var(--muted);line-height:1.5}
-.argcard .unset span{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;white-space:nowrap}
+table.args{table-layout:fixed;width:100%} table.args th,table.args td{white-space:normal;text-align:left;vertical-align:top;overflow-wrap:anywhere;line-height:1.4}
+table.args td:first-child{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
 pre.cmd{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--line);padding:10px 12px;border-radius:8px;font-size:12.5px;margin:8px 0}
 table.checks{table-layout:fixed} table.checks th,table.checks td{white-space:normal;text-align:left;vertical-align:top;overflow-wrap:anywhere;line-height:1.4}
 @media (max-width:1150px){table.checks colgroup,table.checks thead{display:none} table.checks,table.checks tbody,table.checks tr,table.checks td{display:block;width:100%} table.checks tr{border-bottom:1px solid var(--line);padding:8px 0} table.checks td{border:0;padding:2px 0} table.checks td[data-l]::before{content:attr(data-l) \": \";color:var(--muted);font-size:12px}}
@@ -1710,13 +1829,14 @@ def _cell(text, cls="", val=None):
 
 
 def _params_table(an):
-    head = ["parameter", "mean", "std", "5%", "median", "95%", "tau", "N/tau", "ESS", "drift z", "status"]
+    head = ["parameter", "mean", "std", "5%", "median", "95%", "R-hat", "R-hat (clean)", "tau", "N/tau", "ESS", "drift z", "status"]
     out = ['<div class="scroll"><table class="sortable"><thead><tr>' + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
     for r in an["params"]:
         nm = r["name"] + (" (derived)" if r["derived"] else "")
         tau_txt = _fmt(r["tau"]) + ("" if r["tau_resolved"] else " *")
         out.append("<tr>" + _cell(nm) + _cell(_fmt(r["mean"]), val=r["mean"]) + _cell(_fmt(r["std"]), val=r["std"]) +
                    _cell(_fmt(r["q05"]), val=r["q05"]) + _cell(_fmt(r["q50"]), val=r["q50"]) + _cell(_fmt(r["q95"]), val=r["q95"]) +
+                   _cell(_fmt(r["rhat"]), r["st_rhat"], r["rhat"]) + _cell(_fmt(r["rhat_clean"]), val=r["rhat_clean"]) +
                    _cell(tau_txt, val=r["tau"]) + _cell(_fmt(r["n_over_tau"]), r["st_tau"], r["n_over_tau"]) +
                    _cell(_fmt(r["ess"]), r["st_ess"], r["ess"]) + _cell(_fmt(r["drift_z"]), r["st_drift"], r["drift_z"]) +
                    _cell(r["status"].upper(), r["status"]) + "</tr>")
@@ -2066,8 +2186,10 @@ def _dist_explorer_html(run, an):
 
 
 def _stat_guide_html():
-    """What N/tau and drift z mean, with the values to expect."""
-    rows = [("N / tau", "How long the chain is in units of the autocorrelation time tau, the number of steps a walker needs to forget where it was. Roughly the number of independent samples per walker.",
+    """What R-hat, N/tau and drift z mean, with the values to expect."""
+    rows = [("R-hat", "Do all walkers describe the same distribution? Compares the spread between walkers with the spread inside each walker; it is 1 when they agree.",
+             "close to 1, below 1.01", "above 1.05"),
+            ("N / tau", "How long the chain is in units of the autocorrelation time tau, the number of steps a walker needs to forget where it was. Roughly the number of independent samples per walker.",
              "50 or more", "below 20"),
             ("drift z", "Has the chain stopped moving? The difference between the averages of the first and second half of the chain, in standard errors.",
              "within about 3 (random scatter around 0)", "above 5")]
@@ -2109,8 +2231,8 @@ def select_parameters(run, an, k=6, flag_impact=False):
     Choose which parameters to show instead of showing all of them: ln_posterior first, then the k-1 most informative others.
 
     flag_impact=True (and some walkers flagged): the parameters in which the flagged walkers sit furthest from the rest.
-    Otherwise: the highest concern score, the larger of 50 / (N/tau) and |drift z| / 5
-    (a score of 1 or more means at least one of the two statistics is at its limit).
+    Otherwise: the highest concern score, the largest of (R-hat - 1) / 0.05, 50 / (N/tau) and |drift z| / 5
+    (a score of 1 or more means at least one of the three statistics is at its limit).
     Returns (list of names, dict name -> score).
     """
     rows = {r["name"]: r for r in an["params"]}
@@ -2123,6 +2245,8 @@ def select_parameters(run, an, k=6, flag_impact=False):
     else:
         def concern(r):
             parts = []
+            if np.isfinite(r["rhat"]):
+                parts.append((r["rhat"] - 1.0) / 0.05)
             if np.isfinite(r["n_over_tau"]) and r["n_over_tau"] > 0:
                 parts.append(50.0 / r["n_over_tau"])
             if np.isfinite(r["drift_z"]):
@@ -2486,65 +2610,34 @@ def _reconstruct_command(args_dict):
 
 
 def _arguments_section(arguments, command_line, reference_values, run, an):
-    """
-    The 'Arguments' section: what the run was started with, and what the diagnostics used. Kept small: one compact card
-    per group with two columns (argument, value); what an argument means appears when you hover over it, and the
-    arguments that are not set or are off are listed in one line per card.
-    """
+    """The 'Arguments' section: what the run was started with, and what the diagnostics used."""
     d = None
     if arguments is not None:
         d = dict(vars(arguments)) if hasattr(arguments, "__dict__") else dict(arguments)
-    cards = []
+    out = ['<section id="arguments"><h2>Arguments</h2>']
 
-    def card(title, rows, unset=()):
-        t = [f'<div class="argcard"><h4>{_html.escape(title)}</h4><table class="argc"><tbody>']
-        for name, meaning, value in rows:
-            if isinstance(value, list):                          # several long values (file paths): one line each, cut with ... (full text on hover)
-                cell = "".join(f'<div class="line path" title="{_html.escape(v)}">{_html.escape(v)}</div>' for v in value)
-            else:
-                cell = f'<div class="line">{_html.escape(value)}</div>'
-            t.append(f'<tr><td title="{_html.escape(meaning)}">{_html.escape(name)}</td><td>{cell}</td></tr>')
+    def table(rows, head=("argument", "what it is", "value")):
+        t = ['<table class="args"><colgroup><col style="width:27%"><col style="width:40%"><col style="width:33%"></colgroup>'
+             f'<thead><tr><th>{head[0]}</th><th>{head[1]}</th><th>{head[2]}</th></tr></thead><tbody>']
+        for a, m, v in rows:
+            t.append(f"<tr><td>{_html.escape(a)}</td><td>{_html.escape(m)}</td><td>{_html.escape(v)}</td></tr>")
         t.append("</tbody></table>")
-        if unset:
-            t.append('<p class="unset">not set or off: ' + ", ".join(f"<span>{_html.escape(u)}</span>" for u in unset) + "</p>")
-        t.append("</div>")
         return "".join(t)
 
-    def is_unset(v):
-        return v is None or v is False or (isinstance(v, (list, tuple)) and len(v) == 0)
-
-    def shown(k, v):
-        if isinstance(v, (list, tuple)) and k in ("data", "psd") and len(v) > 1:
-            return [_fmt_arg(x) for x in v]
-        return _fmt_arg(v)
-
-    details = ""
     if d is not None:
+        out.append('<p class="muted">The arguments the run was started with, as parsed (defaults included).</p>')
         used = set()
         for title, entries in _ARG_GROUPS:
-            rows, unset = [], []
-            for k, flag, meaning in entries:
-                if k in d:
-                    if is_unset(d[k]):
-                        unset.append(flag)
-                    else:
-                        rows.append((flag, meaning, shown(k, d[k])))
+            rows = [(flag, meaning, _fmt_arg(d[k])) for k, flag, meaning in entries if k in d]
             used |= {k for k, _, _ in entries}
-            if rows or unset:
-                cards.append(card(title, rows, unset))
-        rows, unset = [], []
-        for k, v in d.items():
-            if k not in used:
-                flag = "--" + k.replace("_", "-")
-                if is_unset(v):
-                    unset.append(flag)
-                else:
-                    rows.append((flag, "", shown(k, v)))
-        if rows or unset:
-            cards.append(card("Other", rows, unset))
+            if rows:
+                out.append(f"<h3>{title}</h3>" + table(rows))
+        other = [("--" + k.replace("_", "-"), "", _fmt_arg(v)) for k, v in d.items() if k not in used]
+        if other:
+            out.append("<h3>Other</h3>" + table(other))
         cmd = command_line if command_line else _reconstruct_command(d)
         label = "Command line" if command_line else "Command line (reconstructed from the parsed arguments)"
-        details = f'<details><summary>{label}</summary><pre class="cmd">{_html.escape(cmd)}</pre></details>'
+        out.append(f'<details><summary>{label}</summary><pre class="cmd">{_html.escape(cmd)}</pre></details>')
 
     if reference_values:
         sky = bool(d.get("vary_skypos")) if d is not None else None
@@ -2554,16 +2647,15 @@ def _arguments_section(arguments, command_line, reference_values, run, an):
         rows = []
         for key, label, sampled in names:
             if key in reference_values:
-                role = ("sampled; reference value only" if sampled else "fixed") if sampled is not None else ""
-                rows.append((key, label, _fmt_arg(float(reference_values[key])) + (f" ({role})" if role else "")))
+                role = ("sampled; this is only the reference value" if sampled else "fixed at this value") if sampled is not None else ""
+                rows.append((key, label + (f": {role}" if role else ""), _fmt_arg(float(reference_values[key]))))
         if rows:
-            cards.append(card("Reference values used by the run", rows))
+            out.append("<h3>Reference values used by the run</h3>" + table(rows))
 
     layout = detect_layout(run.raw_names)
     rows = [("emcee file", "the file these diagnostics were made from", str(run.source)),
             ("steps in the file", "", f"{run.nsteps_total:,}"), ("walkers", "", f"{run.nwalkers}"),
-            ("sampled columns", "numbers sampled per walker", f"{run.ndim}" + (f" ({layout['spin_model']} spins; sky position {'sampled' if layout['vary_skypos'] else 'fixed'}; time {'sampled' if layout['vary_time'] else 'fixed'}"
-                                                                                   + ("; eccentricity sampled" if layout['eccentric'] else "") + ")" if layout else ""))]
+            ("sampled columns", "numbers sampled per walker", f"{run.ndim}" + (f" ({layout['spin_model']} spins; sky position {'sampled' if layout['vary_skypos'] else 'fixed'}; time {'sampled' if layout['vary_time'] else 'fixed'})" if layout else ""))]
     if run.stride > 1:
         rows.append(("steps read", run.thin_note or f"every {_ordinal(run.stride)} step", f"{run.n:,} of {run.nsteps_total:,}"))
     rows.append(("estimated burn-in", "from the ensemble-median ln p", f"step {an['est_step']:,}" if an["est_found"] else "no plateau found"))
@@ -2574,24 +2666,22 @@ def _arguments_section(arguments, command_line, reference_values, run, an):
         rows.append(("prior bounds for the physical parameters",
                      "used to convert the sampled numbers" + (" (tdinf defaults)" if pi["auto"] else ""),
                      f"total mass {pi['mtot_lim'][0]:g} to {pi['mtot_lim'][1]:g}; mass ratio {pi['q_lim'][0]:g} to {pi['q_lim'][1]:g}; "
-                     f"distance {pi['dist_lim'][0]:g} to {pi['dist_lim'][1]:g}; spin magnitude {pi['chi_lim'][0]:g} to {pi['chi_lim'][1]:g}"
-                     + (f"; eccentricity {pi['ecc_lim'][0]:g} to {pi['ecc_lim'][1]:g}" if pi.get("eccentric") else "")))
+                     f"distance {pi['dist_lim'][0]:g} to {pi['dist_lim'][1]:g}; spin magnitude {pi['chi_lim'][0]:g} to {pi['chi_lim'][1]:g}"))
     rows.append(("walker-flag rules", "fixed set of criteria", f"version {FLAG_RULES_VERSION}"))
-    cards.append(card("What the diagnostics used", rows))
-
-    intro = ('<p class="muted">The arguments the run was started with, as parsed (defaults included). Hover over an argument to see what it does.</p>'
-             if d is not None else "")
-    return '<section id="arguments"><h2>Arguments</h2>' + intro + '<div class="argcols">' + "".join(cards) + "</div>" + details + "</section>"
+    out.append("<h3>What the diagnostics used</h3>" + table(rows, head=("setting", "what it is", "value")))
+    out.append("</section>")
+    return "".join(out)
 
 
 def _scan_table(an):
     sc = an.get("burn_scan")
     if sc is None or len(sc["step"]) == 0:
         return ""
-    head = ["steps removed", "% of run", "min N/tau", "max |drift z|", "plateau median ln p"]
+    head = ["steps removed", "% of run", "max R-hat", "min N/tau", "max |drift z|", "plateau median ln p"]
     out = ['<table><thead><tr>' + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
     for k in range(len(sc["step"])):
         out.append("<tr>" + _cell(f"{sc['step'][k]:,}") + _cell(f"{100 * sc['frac'][k]:.0f}%") +
+                   _cell(_fmt(sc["rhat"][k]), _status(sc["rhat"][k], 1.01, 1.05)) +
                    _cell(_fmt(sc["n_over_tau"][k]), _status(sc["n_over_tau"][k], 50, 20, True)) +
                    _cell(_fmt(sc["drift"][k]), _status(sc["drift"][k], 3, 5)) + _cell(_fmt(sc["plateau"][k])) + "</tr>")
     out.append("</tbody></table>")
@@ -2600,7 +2690,7 @@ def _scan_table(an):
 
 def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=True, dpi=110,
                  trace_params=None, physical="auto", arguments=None, command_line=None, reference_values=None,
-                 **analysis_kwargs):
+                 extras=None, kind="emcee", **analysis_kwargs):
     """
     Analyse `run` and write a self-contained HTML report (images embedded, no internet needed).
     burn=0 (default) discards nothing; see `analyze` for the other options.
@@ -2613,6 +2703,11 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
     arguments : the arguments the run was started with (an argparse Namespace or a dict); shown in the Arguments section.
     command_line : the command line as a string (otherwise it is reconstructed from `arguments`).
     reference_values : dict with right_ascension, declination, polarization, geocenter_time as used by the run.
+    extras : optional callable extras(run, an) -> dict, called once the analysis is done, for samplers with more to report than walkers (sampler_diagnostics uses it for the
+    tempering of Eryn). The dict may hold: "sections" (list of (id, title, html), shown before Methods and in the navigation), "checks" (list of dicts with key, label, status
+    ("ok", "warn", "bad", "na"), value, rule: added to the checks table and to the verdict), "diagnosis" and "suggestions" (lists of sentences), "cards" (list of (label, value)
+    or (label, value, tooltip)), "methods" (html added to the Methods section) and "header" (text added to the line under the title).
+    kind : the name of the sampler, used in the default title.
     Returns the analysis dict.
     """
     t0 = time.time()
@@ -2632,7 +2727,15 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
             physical_problem = ("The column names are not a tdinf layout, so the run configuration is unknown. "
                                 "Read the file with names=get_layout(...), or pass physical=dict(...).")
     an = analyze(run, burn=burn, **analysis_kwargs)
-    title = title or f"emcee diagnostics: {run.source}"
+    ex = extras(run, an) if extras is not None else {}
+    if ex.get("checks"):
+        an["checks"] = list(an["checks"]) + [dict(c) for c in ex["checks"]]
+        an["verdict"] = _worst(an["verdict"], *[c["status"] for c in ex["checks"]])
+    if ex.get("diagnosis"):
+        an["diagnosis"] = list(an["diagnosis"]) + list(ex["diagnosis"])
+    if ex.get("suggestions"):
+        an["suggestions"] = list(an["suggestions"]) + list(ex["suggestions"])
+    title = title or f"{kind} diagnostics: {run.source}"
     verdict_text = {"ok": "No red flags in the automated checks", "warn": "Some checks need attention",
                     "bad": "Problems detected: do not trust these chains yet", "na": "Not enough information"}[an["verdict"]]
 
@@ -2642,6 +2745,7 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
              ("steps analysed", f"{an['n_post'] * run.stride:,}"), ("flagged walkers", f"{len(an['flagged'])}")]
     if an["burn_idx"] > 0:
         cards.insert(4, ("burn-in removed", f"{an['burn_step']:,}"))
+    cards.extend(ex.get("cards", []))
     cards_html = "".join(f'<div class="card" title="{c[2] if len(c) > 2 else ""}"><div class="k">{c[0]}</div><div class="v">{c[1]}</div></div>' for c in cards)
     burn_note = (f'<p class="muted">{_html.escape(run.thin_note)} Autocorrelation times are scaled back by the stride, so N/tau is not affected.</p>'
                  if run.stride > 1 else "")
@@ -2675,7 +2779,7 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
         f'({3 * bi_["med_sd"]:.2f}): {bi_["tol"]:.2f}.</li>'
         f'<li>The burn-in ends at the start of the first block after which every block median stays above plateau minus tolerance. Here: {found_txt}</li>'
         '<li>The estimate decides where walkers are judged (frozen, low ln p, offset) and where the purple dashed lines are drawn. '
-        'The plots below show N/tau and drift as a function of the number of steps removed from the start.</li></ol>'
+        'The plots below show R-hat, N/tau and drift as a function of the number of steps removed from the start.</li></ol>'
         '<p class="muted">Limits: the resolution is one block; it only looks at the ensemble-median ln p, so it cannot tell whether individual walkers have forgotten their start '
         'or whether every parameter has equilibrated. Treat it as a lower bound.</p></details>')
 
@@ -2696,25 +2800,21 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
 
     secs.append('<section id="burnin"><h2>Burn-in</h2>'
                 '<p class="muted">Top: the approach of ln p to its plateau on a log step axis; the purple dashed line is the estimated burn-in and the green band is the tolerance used to find it. '
-                'Bottom: two convergence statistics recomputed after removing the first part of the run. If a statistic keeps improving as more steps are removed, the chain has not forgotten its start.</p>'
+                'Bottom: three convergence statistics recomputed after removing the first part of the run. If a statistic keeps improving as more steps are removed, the chain has not forgotten its start.</p>'
                 + burn_explain
                 + _stat_guide_html()
-                + '<p class="muted" style="margin-top:8px">In the plots each statistic is the worst value over all parameters: the smallest N/tau, the largest |drift z|. '
+                + '<p class="muted" style="margin-top:8px">In the plots each statistic is the worst value over all parameters: the largest R-hat, the smallest N/tau, the largest |drift z|. '
                   'Green dashed line: the value that separates good from not good; red dotted line: the value beyond which it is a problem; green shading: the good region.</p>'
                 + _img(plot_burnin(run, an), "burn-in", dpi) + "<h3>Statistics versus steps removed</h3>" + _scan_table(an)
                 + '<p class="muted">The scan uses up to 3000 evenly spaced steps and 128 unflagged walkers for speed.</p></section>')
 
     phys_names = [nm for nm in run.names if nm in run.derived_names]
     if phys_names:
-        time_names = [nm for nm, raw in zip(run.col_names, run.raw_names) if raw == "geocenter_time"]      # the sampled time column
-        hist_names = ["ln_posterior"] + phys_names + time_names
+        hist_names = ["ln_posterior"] + phys_names
         pi = run.physical_info
-        hist_intro = ("Physical parameters, converted from the sampled numbers (ln p is included as well"
-                      + ("; the geocenter time is the sampled column itself, in seconds relative to the GPS time in its name" if time_names else "")
-                      + "). Prior bounds used for the conversion: "
+        hist_intro = ("Physical parameters, converted from the sampled numbers (ln p is included as well). Prior bounds used for the conversion: "
                       f"total mass {pi['mtot_lim'][0]:g} to {pi['mtot_lim'][1]:g}, mass ratio {pi['q_lim'][0]:g} to {pi['q_lim'][1]:g}, "
                       f"distance {pi['dist_lim'][0]:g} to {pi['dist_lim'][1]:g} Mpc, spin magnitude {pi['chi_lim'][0]:g} to {pi['chi_lim'][1]:g}"
-                      + (f", eccentricity {pi['ecc_lim'][0]:g} to {pi['ecc_lim'][1]:g}" if pi.get("eccentric") else "")
                       + (" (the tdinf defaults; the h5 file does not store them, so if your run used other bounds pass "
                          "<code>physical=dict(mtot_lim=(...), q_lim=(...), dist_lim=(...), chi_lim=(...))</code>). " if pi["auto"] else ". "))
     else:
@@ -2763,19 +2863,23 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
     tr.append("</section>")
     secs.append("".join(tr))
 
-    secs.append('<section id="convergence"><h2>Convergence and autocorrelation</h2><p class="muted">N/tau above 50 is the primary criterion.</p>'
+    secs.append('<section id="convergence"><h2>Convergence and autocorrelation</h2><p class="muted">N/tau above 50 is the primary criterion; R-hat across walkers is a supporting check because walkers of an ensemble sampler are not independent.</p>'
                 + "<h3>Autocorrelation function</h3>" + _img(plot_acf(run, an), "autocorrelation function", dpi)
                 + "<h3>tau against chain length</h3><p class=\"muted\">tau must level off, and stay under the N/50 line.</p>" + _img(plot_autocorr(an), "autocorrelation time", dpi)
                 + "<h3>Per-parameter statistics</h3>" + _params_table(an)
                 + ('<p class="muted">* tau below 3 rows of the thinned chain: not resolved at this stride. Raise the step limit or thin less.</p>'
                    if run.stride > 1 and any(not r["tau_resolved"] for r in an["params"]) else "") + "</section>")
 
+    for sid, stitle, body in ex.get("sections", []):
+        secs.append(f'<section id="{sid}"><h2>{_html.escape(stitle)}</h2>{body}</section>')
+
     secs.append('<section id="methods"><h2>Methods and caveats</h2>'
                 '<details open><summary>What is computed</summary><ul>'
                 '<li><b>Reading.</b> ' + ("" if run.stride == 1 else f"Only every {_ordinal(run.stride)} saved step was read; autocorrelation times are multiplied back by the stride. ") +
                 'Movement of walkers uses the last steps at full resolution.</li>'
-                '<li><b>Burn-in.</b> Estimated as the start of the first block after which the ensemble-median ln p stays within tolerance of its late-run plateau (explained in the Overview). Walker flags look at the part of the run after it. To remove the first steps before computing N/tau and drift, pass <code>burn="auto"</code>, a fraction, or a number of steps.</li>'
+                '<li><b>Burn-in.</b> Estimated as the start of the first block after which the ensemble-median ln p stays within tolerance of its late-run plateau (explained in the Overview). Walker flags look at the part of the run after it. To remove the first steps before computing R-hat, N/tau and drift, pass <code>burn="auto"</code>, a fraction, or a number of steps.</li>'
                 '<li><b>tau.</b> emcee-style integrated autocorrelation time: autocorrelation of each walker, averaged over walkers, integrated with Sokal\'s window (c = 5). ESS = walkers x N / tau. The sampled ln p is analysed like a parameter.</li>'
+                '<li><b>R-hat.</b> Rank-normalised split R-hat (bulk and folded tail), maximum of the two. The "clean" column excludes flagged walkers.</li>'
                 '<li><b>Drift.</b> Difference between the means of the two halves of the analysed chain, in standard errors computed with the ESS.</li>'
                 '<li><b>Walker flags.</b> The criteria are written out in plain language at the top of the Walkers section, with the numbers used in this run.</li>'
                 '<li><b>Mixing.</b> The spread of the walker medians of ln p divided by the typical spread within one walker. Walkers of a mixed ensemble share the same ln p levels, so this is small (below about 0.3).</li>'
@@ -2783,17 +2887,18 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
                 '<details><summary>Caveats</summary><ul>'
                 '<li>Sampled coordinates may include redundant dimensions (for example radial parts of Cartesian pairs). Their posterior is their prior; they are included in the tables.</li>'
                 '<li>A multimodal posterior can look converged if no walker ever visits the other mode. Check the log-probability distributions of the walkers.</li>'
-                '<li>The early part of the run, before the plateau, makes drift and N/tau look worse; the Burn-in section shows by how much.</li>'
-                '</ul></details></section>')
+                '<li>The early part of the run, before the plateau, makes R-hat, drift and N/tau look worse; the Burn-in section shows by how much.</li>'
+                '</ul></details>' + ex.get("methods", "") + '</section>')
 
-    nav = "".join(f'<a href="#{i}">{t}</a>' for i, t in (("overview", "Overview"), ("arguments", "Arguments"), ("lnp", "Log-probability"), ("burnin", "Burn-in"),
-                                                          ("walkers", "Walkers"), ("traces", "Traces"),
-                                                          ("convergence", "Convergence"), ("methods", "Methods")))
+    nav_items = [("overview", "Overview"), ("arguments", "Arguments"), ("lnp", "Log-probability"), ("burnin", "Burn-in"),
+                 ("walkers", "Walkers"), ("traces", "Traces"), ("convergence", "Convergence")]
+    nav_items += [(sid, stitle) for sid, stitle, _ in ex.get("sections", [])] + [("methods", "Methods")]
+    nav = "".join(f'<a href="#{i}">{_html.escape(t)}</a>' for i, t in nav_items)
     page = (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{_html.escape(title)}</title><style>{_CSS}</style></head><body>'
-            f'<header><h1>{_html.escape(title)}</h1><p>{run.nsteps_total:,} steps, {run.nwalkers} walkers, {run.ndim} sampled numbers</p></header>'
+            f'<header><h1>{_html.escape(title)}</h1><p>{run.nsteps_total:,} steps, {run.nwalkers} walkers, {run.ndim} sampled numbers{_html.escape(ex.get("header", ""))}</p></header>'
             f'<div class="layout"><nav>{nav}</nav><main>{"".join(secs)}</main></div>'
-            f'<footer>report generated in {time.time() - t0:.0f} s by emcee_diagnostics.py</footer><script>{_SORT_JS}</script></body></html>')
+            f'<footer>report generated in {time.time() - t0:.0f} s by sampler_diagnostics.py</footer><script>{_SORT_JS}</script></body></html>')
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(page)
     print(f"wrote {out_path} ({len(page) / 1e6:.1f} MB) in {time.time() - t0:.0f} s; verdict: {an['verdict']}")
@@ -2803,27 +2908,26 @@ def build_report(run, out_path, title=None, burn=0, trace_pages=True, explorer=T
 # ============================================================================== run_sampler integration and command line
 
 _RS_BOUNDS = (("mtot_lim", "total_mass_prior_bounds"), ("q_lim", "mass_ratio_prior_bounds"),
-              ("dist_lim", "luminosity_distance_prior_bounds"), ("chi_lim", "spin_magnitude_prior_bounds"),
-              ("ecc_lim", "eccentricity_prior_bounds"))
+              ("dist_lim", "luminosity_distance_prior_bounds"), ("chi_lim", "spin_magnitude_prior_bounds"))
 _FIXED_ALIASES = {"right_ascension": ("right_ascension", "ra"), "declination": ("declination", "dec"),
                   "polarization": ("polarization", "psi"), "geocenter_time": ("geocenter_time", "geocent_time")}
 
 
-def infer_layout_from_file(path, vary_skypos, vary_time, group="mcmc", eccentric=False):
+def infer_layout_from_file(path, vary_skypos, vary_time, group="mcmc"):
     """
     Work out which columns an emcee file holds from the number of columns and the --vary-skypos / --vary-time flags.
     The spin model follows from the column count (precessing, aligned and spinless runs differ by 4 columns each).
     Returns (spin_model, names). Raises a clear error if the flags do not match the file.
     """
     import h5py
-    sky, tm, ecc = bool(vary_skypos), bool(vary_time), bool(eccentric)
+    sky, tm = bool(vary_skypos), bool(vary_time)
     with h5py.File(path, "r") as f:
         ndim = int(f[group]["chain"].shape[-1])
-    ok = [m for m in ("precessing", "aligned", "none") if len(get_layout(m, sky, tm, ecc)) == ndim]
+    ok = [m for m in ("precessing", "aligned", "none") if len(get_layout(m, sky, tm)) == ndim]
     if len(ok) != 1:
-        raise ValueError(f"{path} has {ndim} sampled columns, which does not match --vary-skypos={sky} --vary-time={tm} --eccentric-analysis={ecc}. "
+        raise ValueError(f"{path} has {ndim} sampled columns, which does not match --vary-skypos={sky} --vary-time={tm}. "
                          f"Run configurations with {ndim} columns: {candidate_layouts(ndim)}")
-    return ok[0], get_layout(ok[0], sky, tm, ecc)
+    return ok[0], get_layout(ok[0], sky, tm)
 
 
 def _fixed_from_json(path):
@@ -2847,15 +2951,32 @@ def _print_summary(an):
     print(f"  {len(an['flagged'])} of {an['w']} walkers flagged (rules version {FLAG_RULES_VERSION})")
 
 
+def _physical_from_args(args, kwargs, spin_model, sky, tm, fixed=None):
+    """The `physical` settings of build_report from run_sampler's args (prior bounds, reference values of what was not sampled) and kwargs."""
+    phys = dict(spin_model=spin_model, vary_skypos=sky, vary_time=tm)
+    for key, attr in _RS_BOUNDS:
+        v = getattr(args, attr, None)
+        if v is not None:
+            phys[key] = tuple(float(x) for x in v)
+    fx = {}
+    ref = getattr(args, "reference_parameters", None)
+    if ref and os.path.exists(str(ref)):
+        fx.update(_fixed_from_json(str(ref)))
+    if kwargs:
+        fx.update({k: float(kwargs[k]) for k in _FIXED_ALIASES if k in kwargs})
+    fx.update(fixed or {})
+    phys["fixed"] = fx
+    return phys
+
+
 def report_from_args(args, kwargs=None, out_path=None, safe=True, burn=0, thin=1, max_points=None, max_steps=100_000,
                      group="mcmc", title=None, fixed=None, spin_model=None, physical="args", arguments=None,
                      command_line=None, **build_kw):
     """
     Write the diagnostics report for a tdinf run from run_sampler.py's own `args` (and, optionally, its `kwargs` dict).
 
-    Uses args.output_h5 (the emcee backend), args.vary_skypos, args.vary_time, args.eccentric_analysis and the prior-bound
-    arguments (total_mass_prior_bounds, mass_ratio_prior_bounds, luminosity_distance_prior_bounds, spin_magnitude_prior_bounds,
-    eccentricity_prior_bounds).
+    Uses args.output_h5 (the emcee backend), args.vary_skypos, args.vary_time and the four prior-bound arguments
+    (total_mass_prior_bounds, mass_ratio_prior_bounds, luminosity_distance_prior_bounds, spin_magnitude_prior_bounds).
     The spin model is inferred from the number of columns. Right ascension, declination, polarization and geocenter time
     are only needed when they were not sampled; they are taken from `fixed`, then `kwargs`, then args.reference_parameters.
     The report goes to <output_h5 without .h5>_diagnostics.html unless out_path is given.
@@ -2869,27 +2990,12 @@ def report_from_args(args, kwargs=None, out_path=None, safe=True, burn=0, thin=1
     def _go():
         path = args.output_h5
         sky, tm = bool(getattr(args, "vary_skypos", False)), bool(getattr(args, "vary_time", False))
-        ecc = bool(getattr(args, "eccentric_analysis", False))
         if spin_model is None:
-            sm, names = infer_layout_from_file(path, sky, tm, group, ecc)
+            sm, names = infer_layout_from_file(path, sky, tm, group)
         else:
-            sm, names = spin_model, get_layout(spin_model, sky, tm, ecc)
+            sm, names = spin_model, get_layout(spin_model, sky, tm)
         run = read_emcee_h5(path, names=names, group=group, thin=thin, max_points=max_points, max_steps=max_steps or None)
-        phys = physical
-        if isinstance(physical, str) and physical == "args":
-            phys = dict(spin_model=sm, vary_skypos=sky, vary_time=tm, eccentric=ecc)
-            for key, attr in _RS_BOUNDS:
-                v = getattr(args, attr, None)
-                if v is not None:
-                    phys[key] = tuple(float(x) for x in v)
-            fx = {}
-            ref = getattr(args, "reference_parameters", None)
-            if ref and os.path.exists(str(ref)):
-                fx.update(_fixed_from_json(str(ref)))
-            if kwargs:
-                fx.update({k: float(kwargs[k]) for k in _FIXED_ALIASES if k in kwargs})
-            fx.update(fixed or {})
-            phys["fixed"] = fx
+        phys = _physical_from_args(args, kwargs, sm, sky, tm, fixed) if (isinstance(physical, str) and physical == "args") else physical
         out = out_path or (re.sub(r"\.h5$", "", str(path)) + "_diagnostics.html")
         an = build_report(run, out, title=title or f"emcee diagnostics: {os.path.basename(str(path))}", burn=burn,
                           physical=phys, arguments=args if arguments is None else arguments, command_line=command_line,
@@ -2913,19 +3019,17 @@ def _parse_burn(b):
     return 0 if v == 0 else (v if 0 < v < 1 else int(v))
 
 
-def main(argv=None):
+def emcee_main(argv=None):
     """
     Command line that understands run_sampler.py's arguments. You can paste the run_sampler command line; flags that
     are not about the diagnostics are ignored. Example:
-        python emcee_diagnostics.py -o full/full.h5 --vary-skypos --vary-time --total-mass-prior-bounds 150 400
+        python sampler_diagnostics.py emcee -o full/full.h5 --vary-skypos --vary-time --total-mass-prior-bounds 150 400
     """
     p = argparse.ArgumentParser(allow_abbrev=False, description="Diagnose a tdinf emcee backend and write an HTML report. "
                                 "Takes run_sampler.py's arguments; unrelated ones are ignored.")
     p.add_argument("-o", "--output-h5", "--h5", dest="output_h5", default=None, help="the emcee backend file (as in run_sampler.py)")
     p.add_argument("--vary-time", action="store_true", help="as in run_sampler.py: time was sampled")
     p.add_argument("--vary-skypos", action="store_true", help="as in run_sampler.py: sky position was sampled")
-    p.add_argument("--eccentric-analysis", action="store_true", help="as in run_sampler.py: eccentricity and mean anomaly were sampled")
-    p.add_argument("--eccentricity-prior-bounds", "--ecc-lim", type=float, nargs=2, default=[0.0, 0.4])
     p.add_argument("--total-mass-prior-bounds", "--mtot-lim", type=float, nargs=2, default=[200, 350])
     p.add_argument("--mass-ratio-prior-bounds", "--q-lim", type=float, nargs=2, default=[0.17, 1])
     p.add_argument("--luminosity-distance-prior-bounds", "--dist-lim", type=float, nargs=2, default=[100, 10000])
@@ -2951,7 +3055,6 @@ def main(argv=None):
     if not a.output_h5:
         p.error("give the emcee backend with -o/--output-h5, as in run_sampler.py")
     args = argparse.Namespace(output_h5=a.output_h5, vary_time=a.vary_time, vary_skypos=a.vary_skypos,
-                              eccentric_analysis=a.eccentric_analysis, eccentricity_prior_bounds=a.eccentricity_prior_bounds,
                               total_mass_prior_bounds=a.total_mass_prior_bounds, mass_ratio_prior_bounds=a.mass_ratio_prior_bounds,
                               luminosity_distance_prior_bounds=a.luminosity_distance_prior_bounds,
                               spin_magnitude_prior_bounds=a.spin_magnitude_prior_bounds, reference_parameters=a.reference_parameters)
@@ -2961,6 +3064,2224 @@ def main(argv=None):
     report_from_args(args, out_path=a.report, safe=False, burn=_parse_burn(a.burn), thin=a.thin, max_points=a.max_points,
                      max_steps=a.max_steps, group=a.group, title=a.title, fixed=fixed, spin_model=a.spin_model,
                      physical=False if a.no_physical else "args", arguments=_loose_parse(tokens), command_line=" ".join(tokens))
+
+
+# ==============================================================================================================================================
+# PART 2: bilby_mcmc (what used to be bilby_diagnostics.py; the names that differ from the emcee part carry a bilby_ prefix)
+# ==============================================================================================================================================
+
+
+# ============================================================================== reading the pickle without bilby or dill
+
+class Placeholder:
+    def __init__(self, *args, **kwargs):          # an unknown global that the pickle calls with arguments (types.MethodType, a function rebuilt by dill ...): the arguments are only kept
+        if args:
+            self.__dict__['_args'] = args
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+        elif isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], dict):
+            self.__dict__.update(state[1])
+        else:
+            self._state = state
+
+    # a class that is not known here may have been a dict, list or set (bilby's PriorDict, which the prior-draw proposals of the tdinf_gw cycle keep a reference to): accept what the
+    # pickle then does to it, and keep it in plain attributes
+    def __setitem__(self, key, value):
+        self.__dict__.setdefault('_items', {})[key] = value
+
+    def __getitem__(self, key):
+        return self.__dict__.get('_items', {})[key]
+
+    def append(self, value):
+        self.__dict__.setdefault('_list', []).append(value)
+
+    def extend(self, values):
+        self.__dict__.setdefault('_list', []).extend(values)
+
+    def add(self, value):
+        self.__dict__.setdefault('_list', []).append(value)
+
+    def update(self, *args, **kwargs):
+        self.__dict__.setdefault('_items', {}).update(*args, **kwargs)
+
+    def __repr__(self):
+        return f"<{type(self).__name__}>"
+
+
+_made = {}
+
+
+def _placeholder(module, name):
+    if (module, name) not in _made:
+        _made[(module, name)] = type(name, (Placeholder,), {'__module__': module})
+    return _made[(module, name)]
+
+
+def _create_array(f, args, state, npdict=None):       # dill's way of pickling a numpy array (f is numpy's own _reconstruct, via the whitelist)
+    array = f(*args)
+    array.__setstate__(state)
+    if npdict is not None:
+        array.__dict__ = npdict
+    return array
+
+
+_SAFE = {('collections', n) for n in ('Counter', 'OrderedDict', 'defaultdict', 'deque')} | {('copyreg', '_reconstructor'), ('copyreg', '__newobj__')} | \
+        {('builtins', n) for n in ('set', 'frozenset', 'slice', 'complex', 'bytearray', 'range', 'object', 'list', 'dict', 'tuple', 'int', 'float', 'str', 'bytes')}
+
+
+_NAMEDTUPLES = {
+    'ConvergenceInputs': ['autocorr_c', 'burn_in_nact', 'thin_by_nact', 'fixed_discard', 'target_nsamples', 'stop_after_convergence', 'L1steps', 'L2steps', 'min_tau', 'fixed_tau', 'tau_window'],
+    'ParallelTemperingInputs': ['ntemps', 'nensemble', 'Tmax', 'Tmax_from_SNR', 'initial_betas', 'adapt', 'adapt_t0', 'adapt_nu', 'pt_ensemble'],
+}
+
+
+class _Safe(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module.startswith('numpy') and name in ('_reconstruct', 'ndarray', 'dtype', 'scalar', 'float64', 'int64', 'bool_', 'float32', 'int32'):
+            import importlib
+            return getattr(importlib.import_module(module), name)
+        if (module, name) in _SAFE:
+            import importlib
+            return getattr(importlib.import_module(module), name)
+        if module.endswith('bilby_mcmc.utils') and name in _NAMEDTUPLES:      # bilby's two input tuples, when a file was written by plain pickle instead of dill
+            return collections.namedtuple(name, _NAMEDTUPLES[name])
+        if module == 'dill._dill' and name == '_create_namedtuple':
+            return lambda n, fields, mod, defaults=None: collections.namedtuple(n, fields, defaults=defaults)
+        if module == 'dill._dill' and name == '_create_array':
+            return _create_array
+        if module == 'dill._dill' and name == '_load_type':                 # dill's way of pickling a class object (the prior-draw proposals of the tdinf_gw cycle hold some)
+            return lambda type_name, *args: _placeholder('dill.types', str(type_name))
+        if module == 'dill._dill':                                          # any other dill helper (functions, code objects, cells ...): never run, the arguments are only kept
+            def inert(*args, **kwargs):
+                held = _placeholder('dill._dill', name)()
+                held._args = args
+                return held
+            return inert
+        return _placeholder(module, name)
+
+
+def load(path):
+    with open(path, 'rb') as f:
+        return _Safe(f).load()
+
+
+# ============================================================================== the run
+
+TWO_PI = 2 * np.pi
+CIRCULAR_PERIOD = {"phase": TWO_PI, "right_ascension": TWO_PI, "mean_anomaly": TWO_PI, "spin1_azimuth": TWO_PI, "spin2_azimuth": TWO_PI, "polarization": np.pi}
+SHORT = {"AdaptiveGaussianProposal": "AG", "DifferentialEvolutionProposal": "DE", "FisherMatrixProposal": "Fisher", "FixedGaussianProposal": "FG", "UniformProposal": "Uniform",
+         "PriorProposal": "Prior draw", "KDEProposal": "KDE", "GMMProposal": "GMM", "EnsembleStretch": "Stretch", "TdinfPolarisationPeriodJump": "psi+pi jump"}
+PHYSICAL_NEEDED = ("total_mass", "mass_ratio", "spin1_magnitude", "spin2_magnitude", "spin1_tilt", "spin2_tilt")
+
+
+def _kind(p):
+    n = type(p).__name__
+    return SHORT.get(n, n.replace("Proposal", ""))
+
+
+def _acc(p):
+    a, r = getattr(p, "_accepted", getattr(p, "accepted", 0)), getattr(p, "_rejected", getattr(p, "rejected", 0))
+    return a / (a + r) if (a + r) else float("nan"), int(a + r)
+
+
+def _first(sampler, kind):
+    return next((p for p in sampler.proposal_cycle.proposal_list if type(p).__name__ == kind), None)
+
+
+class BilbyRun:
+    """What the resume pickle of a bilby_mcmc run holds, as arrays: every chain (all temperatures, all ensemble members), the settings and the counters."""
+
+    def __init__(self, pt, path, drop=None):
+        self.pt, self.path, self.drop = pt, str(path), drop
+        sd = pt.sampler_dictionary
+        self.sd = sd
+        self.nT = len(sd)
+        self.nE = len(sd[0])
+        c0 = sd[0][0].chain
+        self.keys = list(c0.keys)
+        self.names = list(self.keys[:-2])
+        self.il = self.keys.index("logl") if "logl" in self.keys else len(self.keys) - 2
+        self.arrays = {}
+        self.cold_full = {}                       # the cold chains with every row, for the swap test (dropping rows would remove the evidence)
+        for T in sd:
+            for E in range(len(sd[T])):
+                c = sd[T][E].chain
+                A = np.asarray(c._chain_array[: c.position + 1])
+                if T == 0:
+                    self.cold_full[E] = A
+                if drop:
+                    A = A[(np.arange(len(A)) % drop[0]) != drop[1]]
+                self.arrays[(T, E)] = A
+        self.rows = min(len(self.arrays[(0, E)]) for E in range(self.nE))
+        self.betas = np.array([float(sd[T][0].beta) for T in sorted(sd)])
+        ci, pi = getattr(pt, "convergence_inputs", None), getattr(pt, "pt_inputs", None)
+        self.conv = dict(ci._asdict()) if hasattr(ci, "_asdict") else {}
+        self.ptin = dict(pi._asdict()) if hasattr(pi, "_asdict") else {}
+        self.L1 = int(getattr(pt, "L1steps", self.conv.get("L1steps", 1)))
+        self.L2 = int(getattr(pt, "L2steps", self.conv.get("L2steps", 1)))
+        self.swap_rounds = int(getattr(pt, "swap_counter", {}).get("temperature", 0))
+        self.iterations = self.swap_rounds * self.L2
+        self.rows_per_iter = (len(self.arrays[(0, 0)]) / self.iterations) if self.iterations else 1.0
+        self.sampling_time = float(getattr(pt, "sampling_time", 0.0))
+        self.adapting = bool(getattr(pt, "adapt", False))
+        self.hist_n = sorted(getattr(pt, "_nsamples_dict", {}).items())
+        self.hist_tau = sorted(getattr(c0, "max_tau_dict", {}).items())
+        self.bilby_burn = []
+        for E in range(self.nE):
+            b = getattr(sd[0][E].chain, "_last_minimum_index", None)
+            self.bilby_burn.append((int(b[0]), int(b[1]), str(b[2])) if b is not None and len(b) >= 3 else (0, 0, "?"))
+        self.has_physical = all(k in self.names for k in PHYSICAL_NEEDED)
+        self.target = self.conv.get("target_nsamples")
+        self.thin_by = float(self.conv.get("thin_by_nact", 1.0) or 1.0)
+
+    # ---- arrays
+    def logl_cold(self, rows=None):
+        rows = rows or self.rows
+        return np.column_stack([self.arrays[(0, E)][:rows, self.il] for E in range(self.nE)])
+
+    def centres(self, burn):
+        """circular mean of every angle over the cold chains after the burn-in (angles are unwrapped around it before any statistic is computed)"""
+        pooled = np.vstack([self.arrays[(0, E)][burn:] for E in range(self.nE)])
+        return {k: float(np.angle(np.exp(2j * np.pi * pooled[:, self.keys.index(k)] / per).mean()) * per / TWO_PI) for k, per in CIRCULAR_PERIOD.items() if k in self.names}
+
+    def table(self, A, centres, derived=True):
+        """one chain array -> {name: values}; angles unwrapped around their circular mean; derived quantities appended"""
+        out = {}
+        for k in self.names:
+            x = A[:, self.keys.index(k)]
+            if k in CIRCULAR_PERIOD:
+                per = CIRCULAR_PERIOD[k]
+                x = (x - centres[k] + per / 2) % per - per / 2
+            out[k] = x
+        if derived and self.has_physical:
+            out.update(derived_quantities(out))
+        return out
+
+    def stack(self, T, burn, centres, names=None, derived=True):
+        """{name: (n_post, nE_T)} for temperature T"""
+        tabs = [self.table(self.arrays[(T, E)][burn:self.rows], centres, derived) for E in range(len([1 for (t, e) in self.arrays if t == T]))]
+        names = names or list(tabs[0])
+        return {k: np.column_stack([t[k] for t in tabs]) for k in names}
+
+
+def derived_quantities(X):
+    q, a1, a2, t1, t2 = X["mass_ratio"], X["spin1_magnitude"], X["spin2_magnitude"], X["spin1_tilt"], X["spin2_tilt"]
+    M = X["total_mass"]
+    out = {"chi_eff": (a1 * np.cos(t1) + q * a2 * np.cos(t2)) / (1 + q),
+           "chi_p": np.maximum(a1 * np.sin(t1), (4 * q + 3) / (4 + 3 * q) * q * a2 * np.sin(t2)),
+           "spin1_z": a1 * np.cos(t1), "spin2_z": a2 * np.cos(t2), "spin1_in_plane": a1 * np.sin(t1), "spin2_in_plane": a2 * np.sin(t2),
+           "chirp_mass": M * q ** 0.6 / (1 + q) ** 1.2, "mass_1": M / (1 + q), "mass_2": M * q / (1 + q)}
+    return out
+
+
+def choose_burn(run, burn):
+    if isinstance(burn, str) and burn == "bilby":
+        idx = [b[1] for b in run.bilby_burn]
+        v = int(max(idx)) if idx else 0
+        return int(v * (1 - 1.0 / run.drop[0])) if run.drop else v
+    if isinstance(burn, str) and burn == "estimated":
+        return int(estimate_burnin(run.logl_cold())[0])
+    if isinstance(burn, float) and 0 < burn < 1:
+        return int(burn * run.rows)
+    return int(burn)
+
+
+# ============================================================================== swaps, ladder, round trips
+
+def _quantile_points(L, betas, beta, m=500):
+    """m equally weighted ln L values that represent the distribution at inverse temperature beta, from the chain whose beta is closest (importance reweighting)"""
+    k = int(np.argmin(np.abs(np.log(betas) - np.log(beta))))
+    x = np.sort(np.asarray(L[k], dtype=float))
+    w = np.exp((beta - betas[k]) * (x - x.max()))
+    c = np.cumsum(w)
+    c /= c[-1]
+    return np.interp((np.arange(m) + 0.5) / m, c, x)
+
+
+def p_swap(L, betas, ba, bb, m=500):
+    """predicted acceptance of a swap between chains at ba > bb, from the stored ln L: E[min(1, exp((ba - bb)(L_b - L_a)))]"""
+    a, b = _quantile_points(L, betas, ba, m), _quantile_points(L, betas, bb, m)
+    return float(np.mean(np.minimum(1.0, np.exp(np.minimum((ba - bb) * (b[None, :] - a[:, None]), 50.0)))))
+
+
+def equalised_ladder(L, betas, ntemps, beta_min):
+    """ladder from beta = 1 to beta_min with the same predicted swap acceptance in every pair"""
+    def build(p):
+        out = [1.0]
+        for _ in range(ntemps - 1):
+            lo, hi = 1e-4, out[-1]
+            for _ in range(16):
+                mid = np.sqrt(lo * hi)
+                lo, hi = (lo, mid) if p_swap(L, betas, out[-1], mid, 300) > p else (mid, hi)        # acceptance too high: the next beta can be lower
+            out.append(np.sqrt(lo * hi))
+        return out
+    lo, hi = 0.02, 0.95
+    for _ in range(14):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (lo, mid) if build(mid)[-1] > beta_min else (mid, hi)                           # the ladder stops above beta_min: the pairs must be farther apart, so a lower acceptance
+    p = 0.5 * (lo + hi)
+    out = build(p)
+    out[-1] = beta_min
+    return np.array(out), p
+
+
+def round_trip(p, rounds=60000, seed=0):
+    """mean number of swap rounds for a replica to go hot -> cold -> hot with these swap acceptances (adjacent pairs, tried in order from the cold end)"""
+    rng = np.random.default_rng(seed)
+    n = len(p) + 1
+    where = np.arange(n)
+    state, last, trips = "to_cold", None, []
+    for r in range(rounds):
+        for k in range(n - 1):
+            if rng.random() < p[k]:
+                where[k], where[k + 1] = where[k + 1], where[k]
+        t = int(np.flatnonzero(where == n - 1)[0])
+        if state == "to_cold" and t == 0:
+            state = "to_hot"
+        elif state == "to_hot" and t == n - 1:
+            state = "to_cold"
+            if last is not None:
+                trips.append(r - last)
+            last = r
+    return float(np.mean(trips)) if trips else float("nan")
+
+
+def swap_check(run, burn):
+    """do the swaps carry the exchanged state forward? Looks at the cold chain's rows that jump far from the previous row and asks whether the next row returns to the old state."""
+    out = []
+    keys = [k for k in run.names if k not in CIRCULAR_PERIOD] or run.names
+    ix = [run.keys.index(k) for k in keys]
+    b0 = max([b[1] for b in run.bilby_burn] + [0]) if run.drop else burn                # with dropped rows the cut is in the original row numbers
+    for E in range(run.nE):
+        Z = run.cold_full[E][b0:][:, ix]
+        n = len(Z)
+        if n < 400:
+            out.append(dict(jumps=0, frac=0.0, share=float("nan"), verdict="na"))
+            continue
+        Z = Z / (Z.std(axis=0) + 1e-300)
+        step = np.linalg.norm(np.diff(Z, axis=0), axis=1)
+        typical = np.median(step)
+        big = np.r_[False, step > 4 * typical]                      # row k jumped away from row k-1
+        t = np.arange(2, n - 1)
+        jump = big[t] & ~big[t - 1]
+        tj = t[jump]
+        if len(tj) < 30:
+            out.append(dict(jumps=len(tj), frac=len(tj) / max(len(t), 1), share=float("nan"), verdict="na"))
+            continue
+        returns = np.linalg.norm(Z[tj + 1] - Z[tj - 1], axis=1) < np.linalg.norm(Z[tj + 1] - Z[tj], axis=1)
+        share = float(returns.mean())
+        out.append(dict(jumps=len(tj), frac=len(tj) / len(t), share=share, verdict="bad" if share > 0.7 else "ok" if share < 0.3 else "na"))
+    return out
+
+
+# ============================================================================== proposals: step sizes and prior walls
+
+def step_sizes(run, X):
+    """the step of the all-parameter adaptive Gaussian proposal of the cold chain for every parameter, as a share of the posterior standard deviation"""
+    ag = _first(run.sd[0][0], "AdaptiveGaussianProposal")
+    if ag is None:
+        return None
+    rows = []
+    for k in run.names:
+        if k not in ag.prior_width_dict:
+            continue
+        w = float(ag.prior_width_dict[k])
+        w = 1.0 if not np.isfinite(w) else w
+        sig = float(ag.sigmas.get(k, 1.0)) if hasattr(ag, "sigmas") else 1.0
+        step = float(ag.scale) * w * sig
+        sd = float(np.std(X[k]))
+        rows.append(dict(name=k, width=w, sigma=sig, step=step, post_sd=sd, share=step / sd if sd > 0 else float("nan")))
+    return dict(scale=float(ag.scale), accept=_acc(ag)[0], rows=rows, sigmas_all_one=all(abs(r["sigma"] - 1) < 1e-9 for r in rows))
+
+
+def prior_walls(run, burn, njump=300000, seed=0):
+    """how many differential-evolution jumps of the cold chain would leave the prior, per parameter, and which of those parameters have a hard wall (no reflective / periodic boundary)"""
+    de = _first(run.sd[0][0], "DifferentialEvolutionProposal")
+    if de is None:
+        return None
+    rng = np.random.default_rng(seed)
+    keys = [k for k in run.names if k in de.prior_minimum_dict]
+    ix = [run.keys.index(k) for k in keys]
+    A = np.vstack([run.arrays[(0, E)][burn:run.rows][:, ix] for E in range(run.nE)])
+    if len(A) < 100:
+        return None
+    lo = np.array([de.prior_minimum_dict[k] for k in keys], float)
+    hi = np.array([de.prior_maximum_dict[k] for k in keys], float)
+    kind = [str(de.prior_boundary_dict.get(k)) for k in keys]
+    d = len(keys)
+    frac = float(getattr(de, "mode_hopping_frac", 0.5))
+    x = A[rng.integers(len(A), size=njump)]
+    a, b = A[rng.integers(len(A), size=njump)], A[rng.integers(len(A), size=njump)]
+    gamma = np.where(rng.random(njump) > frac, 1.0, rng.normal(0, 2.38 / np.sqrt(2 * d), njump) * np.exp(np.log(0.1) + np.log(100.0) * rng.random(njump)))
+    y = x + gamma[:, None] * (a - b)
+    finite = np.isfinite(lo) & np.isfinite(hi) & (np.abs(hi - lo) < 1e8)
+    out = (y < lo) | (y > hi)
+    out[:, ~finite] = False
+    per = np.array([k == "periodic" for k in kind])
+    out[:, per] = False
+    hard = np.array([k == "None" for k in kind])
+    return dict(names=keys, boundary=kind, share=out.mean(axis=0), any_hard=float(out[:, hard].any(axis=1).mean()) if hard.any() else 0.0,
+                any_wall=float(out.any(axis=1).mean()), mode_hopping_frac=frac)
+
+
+# ============================================================================== the analysis
+
+def _tau_per_chain(x, c):
+    return np.array([integrated_autocorr_time(_fill_nan(x[:, [e]]), c) for e in range(x.shape[1])])
+
+
+def bilby_analyze(run, burn="bilby", tau_c=5.0, ess_target=400, verbose=False):
+    t0 = time.time()
+    an = {"burn_choice": burn}
+    n = run.rows
+    est_idx, est_found, est_info = estimate_burnin(run.logl_cold(), return_info=True)
+    an.update(est_idx=int(est_idx), est_found=bool(est_found), est_info=est_info)
+    bi = choose_burn(run, burn)
+    an["bi"], an["bilby_idx"] = bi, choose_burn(run, "bilby")
+    n_post = n - bi
+    an["n_post"] = n_post
+    centres = run.centres(bi)
+    an["centres"] = centres
+    X = run.stack(0, bi, centres)
+    an["X"] = X
+    names = list(X)
+    sampled = list(run.names)
+    nE = run.nE
+    L = {T: np.concatenate([run.arrays[(T, E)][bi:run.rows][:, run.il] for E in range(len([1 for (t, e) in run.arrays if t == T]))]) for T in range(run.nT)}
+    an["lnl_by_T"] = L
+    ct = run.conv.get("target_nsamples")
+
+    # ---- per parameter
+    rows = []
+    for j, nm in enumerate(names):
+        if verbose:
+            print(f"  [{j + 1}/{len(names)}] {nm}", flush=True)
+        x = _fill_nan(X[nm])
+        tau = integrated_autocorr_time(x, tau_c)
+        tc = _tau_per_chain(x, tau_c)
+        rb, rt = rhat_bulk_tail(x) if nE >= 2 else (np.nan, np.nan)
+        rhat = np.nanmax([rb, rt]) if np.isfinite([rb, rt]).any() else np.nan
+        ok = np.isfinite(tau) and tau > 0
+        n_over = n_post / tau if ok else np.nan
+        ess = nE * n_post / tau if ok else np.nan
+        dz = drift_z(x, tau)
+        q05, q50, q95 = np.percentile(x, [5, 50, 95])
+        st = dict(tau=_status(n_over, 50, 20, True), rhat=_status(rhat, 1.01, 1.05), ess=_status(ess, ess_target, ess_target / 2.5, True), drift=_status(abs(dz) if np.isfinite(dz) else np.nan, 3, 5))
+        rows.append(dict(name=nm, derived=nm not in sampled, mean=float(x.mean()), std=float(x.std()), q05=float(q05), q50=float(q50), q95=float(q95), rhat=rhat, tau=tau,
+                         tau_min=float(np.nanmin(tc)), tau_max=float(np.nanmax(tc)), n_over_tau=n_over, ess=ess, drift_z=dz, st_tau=st["tau"], st_rhat=st["rhat"], st_ess=st["ess"],
+                         st_drift=st["drift"], status=_worst(*st.values())))
+    an["params"] = rows
+    srow = [r for r in rows if not r["derived"]]
+
+    # ---- tau as a function of chain length (computed here) for the slowest parameters
+    slow_names = [r["name"] for r in sorted(srow, key=lambda r: -(r["tau"] if np.isfinite(r["tau"]) else 0))[:6]]
+    Ns = np.unique(np.geomspace(max(40, n_post // 30), n_post, 10).astype(int))
+    an["tau_curve"] = dict(N=Ns, names=slow_names, tau={nm: [integrated_autocorr_time(_fill_nan(X[nm][:N]), tau_c) for N in Ns] for nm in slow_names}) if n_post > 120 else None
+
+    # ---- per temperature
+    tauT = {}
+    for T in range(run.nT):
+        XT = run.stack(T, bi, centres, names=sampled, derived=False)
+        tauT[T] = {nm: integrated_autocorr_time(_fill_nan(XT[nm]), tau_c) for nm in sampled}
+    an["tau_by_T"] = tauT
+
+    # ---- slowest direction of the posterior
+    Zc = np.column_stack([X[k].reshape(-1) for k in sampled])
+    mu, sg = Zc.mean(0), Zc.std(0) + 1e-300
+    evals, evecs = np.linalg.eigh(np.corrcoef(Zc.T))
+    pc_tau = []
+    for j in range(len(sampled)):
+        proj = (((np.column_stack([X[k] for k in sampled]).reshape(n_post, nE, len(sampled)) - mu) / sg) @ evecs[:, j])
+        pc_tau.append(integrated_autocorr_time(proj, tau_c))
+    order = np.argsort(np.nan_to_num(pc_tau, nan=0.0))[::-1]
+    an["slow_dirs"] = [dict(tau=float(pc_tau[j]), eigenvalue=float(evals[j]), loadings=dict(zip(sampled, evecs[:, j]))) for j in order[:3]]
+    v = evecs[:, order[0]]
+    tau_dir_T = {}
+    for T in range(run.nT):
+        XT = run.stack(T, bi, centres, names=sampled, derived=False)
+        proj = ((np.stack([XT[k] for k in sampled], axis=-1) - mu) / sg) @ v
+        tau_dir_T[T] = integrated_autocorr_time(proj, tau_c)
+    an["tau_dir_by_T"] = tau_dir_T
+
+    # ---- swaps, ladder, round trip
+    betas = run.betas
+    acc_pair = []
+    for T in range(run.nT - 1):
+        s = run.sd[T][0]
+        acc_pair.append(s.pt_accepted / max(s.pt_accepted + s.pt_rejected, 1))
+    pred = [p_swap(L, betas, betas[T], betas[T + 1]) for T in range(run.nT - 1)]
+    rt_rounds = round_trip(acc_pair)
+    rows_per_round = run.rows / max(run.swap_rounds, 1)
+    an["swaps"] = dict(recorded=acc_pair, predicted=pred, round_trip_rounds=rt_rounds, rows_per_round=rows_per_round, round_trip_rows=rt_rounds * rows_per_round,
+                       round_trip_iterations=rt_rounds * run.L2)
+    try:
+        beta_eq, p_eq = equalised_ladder(L, betas, run.nT, float(betas[-1]))
+        pred_eq = [p_swap(L, betas, beta_eq[T], beta_eq[T + 1]) for T in range(run.nT - 1)]
+        rt_eq = round_trip(pred_eq)
+        an["ladder_design"] = dict(betas=beta_eq, target=p_eq, predicted=pred_eq, round_trip_rounds=rt_eq)
+    except Exception as e:                                     # the design is an extra; it must not stop the report
+        an["ladder_design"] = None
+        an["ladder_design_error"] = f"{type(e).__name__}: {e}"
+    try:                                         # when every parameter decorrelates within 12 rows at a temperature well below the hottest, a cooler ladder gives a shorter round trip
+        tmax_by_T = [max(v for v in tauT[T].values() if np.isfinite(v)) for T in range(run.nT)]
+        first = next((T for T in range(run.nT) if tmax_by_T[T] <= 12), run.nT - 1)
+        margin = min(first + 1, run.nT - 1)                          # one temperature hotter than the first one that decorrelates
+        beta_need = float(betas[margin])
+        best = None
+        if beta_need > 1.3 * float(betas[-1]) and first >= 1:
+            for nt in range(4, run.nT + 1):
+                lad, p_eq = equalised_ladder(L, betas, nt, beta_need)
+                pred_c = [p_swap(L, betas, lad[T], lad[T + 1]) for T in range(nt - 1)]
+                if min(pred_c) < 0.25:
+                    continue
+                rt_c = round_trip(pred_c, rounds=60000)
+                if best is None or rt_c < best["round_trip_rounds"]:
+                    best = dict(betas=lad, ntemps=nt, predicted=pred_c, round_trip_rounds=rt_c, beta_min=beta_need, first_decorrelating=first, tau_by_T=tmax_by_T)
+        an["ladder_cool"] = best
+    except Exception as e:
+        an["ladder_cool"] = None
+        an["ladder_cool_error"] = f"{type(e).__name__}: {e}"
+    an["swap_check"] = swap_check(run, bi)
+
+    # ---- proposals
+    props = []
+    cyc = run.sd[0][0].proposal_cycle.proposal_list
+    for i, p in enumerate(cyc):
+        row = dict(index=i, kind=_kind(p), n=len(getattr(p, "parameters", [])), weight=float(getattr(p, "weight", float("nan"))), by_T=[], scale=[])
+        for T in range(run.nT):
+            accs, scales = [], []
+            for E in range(len(run.sd[T])):
+                q = run.sd[T][E].proposal_cycle.proposal_list
+                if i < len(q) and type(q[i]).__name__ == type(p).__name__:
+                    a_, k_ = _acc(q[i])
+                    accs.append(a_)
+                    if hasattr(q[i], "scale"):
+                        scales.append(float(q[i].scale))
+            row["by_T"].append(float(np.nanmedian(accs)) if accs else float("nan"))
+            row["scale"].append(float(np.median(scales)) if scales else float("nan"))
+        row["count"] = _acc(p)[1]
+        props.append(row)
+    an["proposals"] = props
+    stretch = getattr(run.pt, "ensemble_proposal_cycle", None)
+    an["stretch"] = None
+    if stretch is not None and getattr(stretch, "proposal_list", None):
+        s_ = stretch.proposal_list[0]
+        an["stretch"] = dict(acc=_acc(s_)[0], count=_acc(s_)[1])
+    an["steps"] = step_sizes(run, X)
+    an["walls"] = prior_walls(run, bi)
+
+    # ---- chains (the cold chains of the ensemble)
+    lnl = run.logl_cold()[bi:]
+    med = np.median(lnl, axis=0)
+    gap = (med - np.median(med)) / max(robust_sd(lnl.reshape(-1)), 1e-12)
+    chains = []
+    tau_by_chain = np.column_stack([_tau_per_chain(_fill_nan(X[k]), tau_c) for k in sampled])        # (nE, nparams)
+    pooled_sd = np.array([np.std(X[k]) for k in sampled])
+    pooled_mean = np.array([np.mean(X[k]) for k in sampled])
+    offsets = np.zeros((nE, len(sampled)))
+    for E in range(nE):
+        for j, k in enumerate(sampled):
+            tj = tau_by_chain[E, j] if np.isfinite(tau_by_chain[E, j]) else 1.0
+            se = pooled_sd[j] * np.sqrt(max(tj, 1.0) / max(n_post, 1))
+            offsets[E, j] = (np.mean(X[k][:, E]) - pooled_mean[j]) / max(se, 1e-300)
+    taus_max = np.nanmax(tau_by_chain, axis=1)
+    med_tau = float(np.nanmedian(taus_max))
+    for E in range(nE):
+        s = run.sd[0][E]
+        flags = []
+        if gap[E] < -3 and (med[np.argmax(med)] - med[E]) > 1.0:
+            flags.append("low ln L")
+        if taus_max[E] > 3 * med_tau and taus_max[E] > 100:
+            flags.append("slow")
+        if np.nanmax(np.abs(offsets[E])) > 5:
+            flags.append("offset")
+        b = run.bilby_burn[E]
+        a_, _ = _acc(s)
+        chains.append(dict(id=E, flags=", ".join(flags), median_lnl=float(med[E]), gap=float(gap[E]), max_lnl=float(np.max(lnl[:, E])), tau_max=float(taus_max[E]),
+                           tau_param=sampled[int(np.nanargmax(tau_by_chain[E]))], n_eff=float(n_post / (run.thin_by * taus_max[E])) if np.isfinite(taus_max[E]) and taus_max[E] > 0 else float("nan"),
+                           burn=b[1], burn_method=b[2], local_accept=s.accepted / max(s.accepted + s.rejected, 1), offset_max=float(np.nanmax(np.abs(offsets[E]))),
+                           offset_param=sampled[int(np.nanargmax(np.abs(offsets[E])))]))
+    an["chains"] = chains
+    an["offsets"] = offsets
+    an["tau_by_chain"] = tau_by_chain
+    an["flagged"] = [c["id"] for c in chains if c["flags"]]
+
+    # ---- bilby's own counting and a corrected estimate of the time to finish
+    n_now = run.hist_n[-1][1] if run.hist_n else float("nan")
+    rate = float(np.nansum([1.0 / (run.thin_by * t) for t in taus_max if np.isfinite(t) and t > 0]))      # independent samples per row, summed over the cold chains
+    n_est = n_post * rate
+    an["counts"] = dict(n_now=n_now, n_peak=max([v for k, v in run.hist_n], default=float("nan")), target=ct, n_est=n_est, rate_per_row=rate)
+    time_per_iter = run.sampling_time / run.iterations if run.iterations else float("nan")
+    an["time"] = dict(per_iteration=time_per_iter, per_step_ms=1e3 * time_per_iter / run.L1 if run.L1 else float("nan"), hours=run.sampling_time / 3600.0)
+    if ct and rate > 0 and np.isfinite(time_per_iter):
+        remaining = max(ct - n_est, 0.0)
+        rows_needed = remaining / rate
+        iters_needed = rows_needed / run.rows_per_iter
+        an["etf"] = dict(remaining=remaining, rows=rows_needed, iterations=iters_needed, hours=iters_needed * time_per_iter / 3600.0)
+        # what bilby's printed line would say: one chain makes all the remaining samples at the primary chain's tau
+        t_prim = taus_max[0]
+        an["etf"]["bilby_hours"] = max(ct - n_est, 0.0) * run.thin_by * t_prim * time_per_iter / 3600.0 if np.isfinite(t_prim) else float("nan")      # bilby: samples x thin x tau x L1 x time per step
+    else:
+        an["etf"] = None
+
+    # ---- burn-in scan: the statistics after discarding more and more of the run
+    fracs = (0.0, 0.05, 0.1, 0.2, 0.3, 0.5)
+    scan = []
+    cen0 = run.centres(0)
+    full = {k: run.stack(0, 0, cen0, names=[k], derived=False)[k] for k in sampled}
+    for f in fracs:
+        b = int(f * n)
+        if n - b < 120:
+            continue
+        rh, nt, dr = [], [], []
+        for k in sampled:
+            x = _fill_nan(full[k][b:])
+            tau_ = integrated_autocorr_time(x, tau_c)
+            if nE >= 2:
+                bb, tt = rhat_bulk_tail(x)
+                rh.append(np.nanmax([bb, tt]))
+            nt.append((n - b) / tau_ if np.isfinite(tau_) and tau_ > 0 else np.nan)
+            dr.append(abs(drift_z(x, tau_)) if np.isfinite(tau_) else np.nan)
+        scan.append(dict(frac=f, rows=b, rhat=float(np.nanmax(rh)) if rh else np.nan, n_over_tau=float(np.nanmin(nt)), drift=float(np.nanmax(dr))))
+    an["burn_scan"] = scan
+
+    # ---- checks
+    sw = an["swaps"]
+    rec = np.array(sw["recorded"], dtype=float)
+    n_over = np.array([r["n_over_tau"] for r in srow], dtype=float)
+    rh = np.array([r["rhat"] for r in srow], dtype=float)
+    ess_arr = np.array([r["ess"] for r in srow], dtype=float)
+    dz_arr = np.abs(np.array([r["drift_z"] for r in srow], dtype=float))
+    wn, wr, we, wd = (int(np.nanargmin(n_over)) if np.isfinite(n_over).any() else 0, int(np.nanargmax(rh)) if np.isfinite(rh).any() else 0,
+                      int(np.nanargmin(ess_arr)) if np.isfinite(ess_arr).any() else 0, int(np.nanargmax(dz_arr)) if np.isfinite(dz_arr).any() else 0)
+    checks = []
+    if len(rec):
+        lo_i, hi_i = int(np.argmin(rec)), int(np.argmax(rec))
+        st = "ok" if rec.min() >= 0.2 else ("warn" if rec.min() >= 0.1 else "bad")
+        if st == "ok" and rec.max() > 0.8:
+            st = "warn"
+        checks.append(("swap", "Swap acceptance between neighbouring temperatures", st, f"lowest {rec.min():.2f} (T{lo_i} to T{lo_i + 1}), highest {rec.max():.2f} (T{hi_i} to T{hi_i + 1})",
+                       "Good from 0.2 up to 0.8 in every pair; check from 0.1; problem below 0.1. A pair that rarely swaps is a bottleneck for the whole ladder."))
+        sp = float(rec.max() - rec.min())
+        checks.append(("spread", "Evenness of the ladder", "ok" if sp < 0.25 else ("warn" if sp < 0.45 else "bad"), f"spread (highest minus lowest) {sp:.2f}",
+                       "Good below 0.25: a ladder with equal acceptances loses the least time. The Temperatures section shows a more even ladder."))
+    sc = an["swap_check"]
+    concl = [s_ for s_ in sc if s_["verdict"] != "na"]
+    if sc:
+        nbad, nok = sum(s_["verdict"] == "bad" for s_ in concl), sum(s_["verdict"] == "ok" for s_ in concl)
+        med_share = float(np.nanmedian([s_["share"] for s_ in concl])) if concl else float("nan")
+        if concl and nbad > len(concl) / 2:
+            checks.append(("carry", "Swaps carry the exchanged state forward", "bad", f"the next row returns to the old state in {100 * med_share:.0f}% of jumps (median over {len(concl)} conclusive chains)",
+                           "In a correct run it is below about 30%. A high value means the swaps only rewrote the stored rows (the bug fixed by make_bilby_swaps_continue)."))
+        elif concl and nok > len(concl) / 2:
+            checks.append(("carry", "Swaps carry the exchanged state forward", "ok", f"the next row returns to the old state in {100 * med_share:.0f}% of jumps (median over {len(concl)} conclusive chains)",
+                           "Good below about 30%."))
+        else:
+            checks.append(("carry", "Swaps carry the exchanged state forward", "na", "not conclusive (too few jumps, mixed results between the chains, or other large moves such as KDE / mixture proposals confuse the test)",
+                           "The test looks at jumps of the stored state and works best for slowly moving chains."))
+    checks.append(("tau", "Chain length vs autocorrelation time", _status(np.nanmin(n_over), 50, 20, True) if np.isfinite(n_over).any() else "na",
+                   f"min N/tau = {np.nanmin(n_over):.1f} ({srow[wn]['name']})" if np.isfinite(n_over).any() else "n/a",
+                   "Good if the cold chains are at least 50 autocorrelation times long; check from 20; problem below 20."))
+    checks.append(("rhat", "Rank-normalised split R-hat between the cold chains", _status(np.nanmax(rh), 1.01, 1.05) if np.isfinite(rh).any() else "na",
+                   f"max R-hat = {np.nanmax(rh):.3f} ({srow[wr]['name']})" if np.isfinite(rh).any() else "needs two or more cold chains",
+                   "Good below 1.01; check up to 1.05; problem above 1.05."))
+    checks.append(("ess", "Effective sample size", _status(np.nanmin(ess_arr), ess_target, ess_target / 2.5, True) if np.isfinite(ess_arr).any() else "na",
+                   f"min ESS = {np.nanmin(ess_arr):.0f} ({srow[we]['name']})" if np.isfinite(ess_arr).any() else "n/a",
+                   f"Good at {ess_target} or more independent samples; check from {ess_target / 2.5:.0f}; problem below that."))
+    checks.append(("drift", "Half-vs-half drift of the means", _status(np.nanmax(dz_arr), 3, 5) if np.isfinite(dz_arr).any() else "na",
+                   f"max |z| = {np.nanmax(dz_arr):.1f} ({srow[wd]['name']})" if np.isfinite(dz_arr).any() else "n/a",
+                   "Good if the two halves agree within 3 standard errors; check up to 5; problem above 5."))
+    nf = len(an["flagged"])
+    checks.append(("chains", "Cold chains that disagree or lag", "ok" if nf == 0 else ("warn" if nf / nE < 0.3 else "bad"), f"{nf} of {nE} flagged",
+                   "A chain is flagged if its ln L is far below the others, its tau is more than 3 times the median, or its mean differs from the others by more than 5 standard errors."))
+    if an["steps"] is not None:
+        worst = min(an["steps"]["rows"], key=lambda r: r["share"] if np.isfinite(r["share"]) else 9)
+        mx = max((r["share"] for r in an["steps"]["rows"] if np.isfinite(r["share"])), default=np.nan)
+        checks.append(("steps", "Size of the adaptive Gaussian steps", _status(min(r["share"] for r in an["steps"]["rows"] if np.isfinite(r["share"])), 0.05, 0.01, True),
+                       f"smallest step is {100 * worst['share']:.1f}% of the posterior sd ({worst['name']}); scale {an['steps']['scale']:.4g}",
+                       "Good if every parameter moves at least 5% of its posterior width per accepted step; check from 1%. One shared scale is adapted for all parameters, so the parameter whose "
+                       "posterior is narrowest compared with its prior sets the steps for all of them."))
+    if an["walls"] is not None:
+        wl = an["walls"]
+        hard_names = ", ".join(nm for nm, k, s_ in zip(wl["names"], wl["boundary"], wl["share"]) if k == "None" and s_ > 0.01) or "none"
+        walls_value = (f"{100 * wl['any_hard']:.0f}% leave a prior with no boundary rule ({hard_names}) and are rejected; "
+                       f"{100 * (wl['any_wall'] - wl['any_hard']):.0f}% more leave only reflective ranges and are reflected back inside")
+        checks.append(("walls", "Differential-evolution jumps rejected at a prior wall", _status(wl["any_hard"], 0.10, 0.30), walls_value,
+                       "Good below 10%. A jump that leaves a prior without a boundary rule is rejected before the likelihood is evaluated (a wasted step). "
+                       "A jump that leaves a reflective prior is reflected back inside and evaluated; a periodic one is wrapped (exact for any symmetric jump). Reflection is exact only for diagonal steps such as the adaptive Gaussian: "
+                       "for differential-evolution and Fisher jumps, whose components are correlated, it can bias the posterior near the walls (see the check on reflective boundaries)."))
+    ag0 = _first(run.sd[0][0], "AdaptiveGaussianProposal")
+    refl = [k for k in run.names if ag0 is not None and str(ag0.prior_boundary_dict.get(k)) == "reflective"]
+    corr_kinds = sorted({p["kind"] for p in props if p["kind"] in ("DE", "Fisher")})
+    if refl and corr_kinds:
+        near = sorted(zip(wl["share"], wl["names"]), reverse=True)[:3] if an["walls"] is not None else []
+        checks.append(("reflect", "Reflective boundaries with correlated jump proposals", "warn",
+                       f"{len(refl)} reflective parameters ({', '.join(refl[:5])}{', ...' if len(refl) > 5 else ''}) and the cycle has {' and '.join(corr_kinds)} proposals",
+                       "Reflection is exact only if the jump distribution is symmetric under flipping each coordinate separately (a diagonal Gaussian). Differential-evolution and Fisher jumps have correlated components, "
+                       "and then reflecting at a wall biases the posterior near it (on a bounded Gaussian: 0.04-0.08 on a mean with sd 0.2, against 0.002 for a hard wall). Hard walls (boundary None) are exact for every proposal."))
+    de_row = next((p for p in props if p["kind"] == "DE" and p["n"] == len(run.names)), None)
+    ag_row = next((p for p in props if p["kind"] == "AG" and p["n"] == len(run.names)), None)
+    if ag_row is not None:
+        a0 = ag_row["by_T"][0]
+        checks.append(("ag", "Adaptive Gaussian acceptance (cold chain)", "ok" if 0.15 <= a0 <= 0.35 else ("warn" if 0.08 <= a0 <= 0.5 else "bad"), f"{a0:.2f}", "The scale is adapted to 0.234; good from 0.15 to 0.35."))
+    if de_row is not None:
+        a0 = de_row["by_T"][0]
+        checks.append(("de", "Differential-evolution acceptance (cold chain)", _status(a0, 0.05, 0.02, True), f"{a0:.3f}", "Good from 5%; check from 2%. With many parameters moving at once DE is accepted rarely; block moves help."))
+    wasted = [p for p in props if p["kind"] in ("KDE", "GMM") and np.isfinite(p["by_T"][0]) and p["count"] > 2000 and p["by_T"][0] < 0.005]
+    if any(p["kind"] in ("KDE", "GMM") for p in props):
+        checks.append(("learn", "Learning proposals (KDE, mixture) in the cold chain", "warn" if wasted else "ok",
+                       (f"{len(wasted)} accepted below 0.5%: " + ", ".join(f"{p['kind']}({p['n']})" for p in wasted)) if wasted else "all accepted at least 0.5%",
+                       "A proposal that is almost never accepted costs time (and is shipped to the workers every iteration). 'noKD' / 'noGM' remove them."))
+    checks.append(("burn", "Burn-in", "ok" if bi < 0.5 * n else "warn", f"bilby discards {an['bilby_idx']:,} of {n:,} rows ({100 * an['bilby_idx'] / n:.0f}%); method {_methods_text(run)}; analysed from row {bi:,}",
+                   "Good if less than half of the run is burn-in."))
+    if run.adapting:
+        checks.append(("adapt", "Temperature adaptation", "warn", "the ladder is still adapting", "The ladder is adapted during the first adapt_t0 x 10 rows and then fixed."))
+    an["checks"] = [dict(key=k, label=l, status=s, value=v, rule=r) for k, l, s, v, r in checks]
+    an["verdict"] = _worst(*[c[2] for c in checks])
+    an["diagnosis"], an["suggestions"] = _bilby_diagnose(run, an)
+    an["seconds"] = time.time() - t0
+    return an
+
+
+def _methods_text(run):
+    ms = collections.Counter(b[2] for b in run.bilby_burn)
+    return ", ".join(f"{m} ({c} chain{'s' if c > 1 else ''})" for m, c in ms.most_common())
+
+
+def _bilby_diagnose(run, an):
+    """Plain-language reading of the numbers and suggestions of what to try, as two lists of sentences (rule based)."""
+    obs, tips = [], []
+    n, bi, nE = run.rows, an["bi"], run.nE
+    sw, srow = an["swaps"], [r for r in an["params"] if not r["derived"]]
+    rec = np.array(sw["recorded"], dtype=float)
+    ck = {c["key"]: c for c in an["checks"]}
+    if "carry" in ck and ck["carry"]["status"] == "bad":
+        obs.append("The temperature swaps do not carry the exchanged state forward: after most jumps of the stored cold chain the next row returns to the chain's own old state. "
+                   "The hot chains then do not feed the cold one, and only the stored rows were rewritten.")
+        tips.append("Install the swap fix (make_bilby_swaps_continue in run_sampler.py) and start a new run; this checkpoint was made while the swaps did not move the chains.")
+    if len(rec) and (rec.min() < 0.2 or rec.max() - rec.min() > 0.3):
+        i = int(np.argmin(rec))
+        obs.append(f"The swap acceptances range from {rec.min():.2f} (T{i} to T{i + 1}) to {rec.max():.2f}; a replica needs about {sw['round_trip_rounds']:.0f} swap rounds, "
+                   f"{sw['round_trip_rows']:,.0f} rows or {sw['round_trip_iterations']:,.0f} iterations, for a hot-to-cold-to-hot round trip.")
+        ld = an.get("ladder_design")
+        if ld is not None:
+            tips.append(f"A ladder with the same hottest temperature and an equal predicted acceptance of {ld['target']:.2f} in every pair would need about {ld['round_trip_rounds']:.0f} swap rounds per round trip "
+                        f"(betas: {', '.join(f'{b:.4f}' for b in ld['betas'])}). Pass them as \"initial_betas\" with \"adapt\": false: bilby's adaptation uses the local acceptance of each chain, not the swap acceptance.")
+    sp = an["steps"]
+    if sp is not None and sp["sigmas_all_one"]:
+        worst = min(sp["rows"], key=lambda r: r["share"] if np.isfinite(r["share"]) else 9)
+        if worst["share"] < 0.05:
+            obs.append(f"The adaptive Gaussian scale is {sp['scale']:.4g}; at that scale {worst['name']} moves {100 * worst['share']:.1f}% of its posterior width per accepted step "
+                       f"(prior width {worst['width']:.4g}, posterior sd {worst['post_sd']:.4g}). One shared scale is set by the parameter whose posterior is narrowest compared with its prior.")
+            tips.append("Give the proposal per-parameter step factors (sigma_i = posterior width / prior width): the cycles tdinf_scaled, tdinf_blocks or tdinf_gw with \"tdinf_posterior_width\" "
+                        "(this report prints the widths in the Proposals section).")
+    wl = an["walls"]
+    if wl is not None and wl["any_hard"] > 0.1:
+        hard = sorted([(s_, nm) for s_, nm, k in zip(wl["share"], wl["names"], wl["boundary"]) if k == "None" and s_ > 0.01], reverse=True)
+        hard_txt = ", ".join(f"{nm} {100 * s_:.0f}%" for s_, nm in hard)
+        reflected = 100 * (wl["any_wall"] - wl["any_hard"])
+        obs.append(f"{100 * wl['any_hard']:.0f}% of the differential-evolution jumps of the cold chain leave a prior that has no boundary rule ({hard_txt}) and are rejected before the likelihood is evaluated. "
+                   f"A further {reflected:.0f}% leave only the range of parameters with a reflective boundary; those are reflected back inside and evaluated, which is exact for diagonal steps but can bias the posterior near the walls for "
+                   "the correlated jumps of differential evolution and Fisher proposals (see the check on reflective boundaries).")
+        if [nm for _, nm in hard] == ["mass_ratio"]:
+            tips.append("The only parameter without a boundary rule is mass_ratio. A hard wall is exact for every proposal; the price is the rejected jumps. (Reflecting at q = 1 would recover them for the diagonal "
+                        "adaptive Gaussian steps, but not for differential evolution or Fisher jumps.)")
+        else:
+            tips.append(f"Parameters without a boundary rule ({', '.join(nm for _, nm in hard)}) have a hard wall, which is exact for every proposal; the price is the rejected jumps. Reflective boundaries recover them "
+                        "but are exact only for diagonal steps (the adaptive Gaussian); for differential-evolution and Fisher jumps they bias the posterior near the walls. bilby's own default priors use hard walls (boundary None) "
+                        "for everything except the periodic angles.")
+    ch = an["chains"]
+    cold_tau = max((r["tau"] for r in srow if np.isfinite(r["tau"])), default=float("nan"))
+    rt_rows = sw["round_trip_rows"]
+    if np.isfinite(cold_tau) and np.isfinite(rt_rows) and rt_rows > 0 and cold_tau >= 0.4 * rt_rows:
+        tm = an.get("ladder_cool", None)
+        decor = [T for T in range(run.nT) if max(v for v in an["tau_by_T"][T].values() if np.isfinite(v)) <= 12]
+        obs.append(f"The slowest autocorrelation time of the cold chains ({cold_tau:.0f} rows) is {100 * cold_tau / rt_rows:.0f}% of the replica round trip ({rt_rows:,.0f} rows): a state has to travel up the ladder and back to "
+                   "decorrelate, so the tempering sets the pace of the cold chain. Better local moves would show up in the warm chains, not in the cold one."
+                   + (f" Every parameter decorrelates within 12 rows from T{decor[0]} (beta {run.betas[decor[0]]:.2f}) upwards, so the hottest temperatures are not needed to decorrelate." if decor else ""))
+        if tm is not None:
+            tips.append(f"A cooler ladder shortens the round trip: {tm['ntemps']} temperatures down to beta {tm['beta_min']:.3f} (T {1 / tm['beta_min']:.1f}) with an equal predicted swap acceptance of {np.mean(tm['predicted']):.2f} would need about "
+                        f"{tm['round_trip_rounds']:.0f} swap rounds per round trip instead of {sw['round_trip_rounds']:.0f} (betas: {', '.join(f'{b:.3f}' for b in tm['betas'])}). Pass them as \"initial_betas\" with \"adapt\": false. "
+                        "Check first that the posterior has no mode that only the hottest chains can reach: compare how often the cold and the warm chains switch between the modes you know of (for example the sky or the inclination modes).")
+        tips.append(f"Swapping more often also shortens it: the round trip is {sw['round_trip_iterations']:,.0f} iterations at L2steps = {run.L2}. \"L2steps\": 1 gives up to {run.L2} times more swap attempts per iteration, but the ensemble step that shares the counter "
+                    f"evaluates the likelihood once per chain, one after another in the main process: with {run.nT * run.nE} chains that adds up to {100 * run.nT * run.nE / (run.L1 * 1):.0f}% of an iteration at L2steps = 1 "
+                    f"(when all chains run in parallel; less with fewer workers than chains). Compare seconds per iteration on a short run.")
+    elif run.L2 > 1:
+        tips.append(f"Swaps happen every {run.L2} iterations (L2steps = {run.L2}). \"L2steps\": 1 swaps every iteration, at the price of an ensemble step (one serial likelihood evaluation per chain) every iteration.")
+    sdr = an["slow_dirs"][0]
+    top = sorted(sdr["loadings"].items(), key=lambda kv: -abs(kv[1]))[:4]
+    obs.append(f"The slowest direction in parameter space (tau about {sdr['tau']:.0f} rows) is a combination: " + ", ".join(f"{k} {c:+.2f}" for k, c in top) + ".")
+    n_over = [(r["n_over_tau"], r["name"]) for r in srow if np.isfinite(r["n_over_tau"])]
+    if n_over and min(n_over)[0] < 50:
+        v, nm = min(n_over)
+        obs.append(f"The cold chains are only {v:.1f} autocorrelation times long for {nm} (50 or more is wanted).")
+        taus = [(r["tau"], r["name"]) for r in srow if np.isfinite(r["tau"])]
+        tau_max, nm2 = max(taus)
+        need = 50 * tau_max
+        tips.append(f"Run longer: the slowest autocorrelation time is about {tau_max:,.0f} rows ({nm2}); 50 of them need about {need:,.0f} rows after the burn-in, roughly {max(need - an['n_post'], 0):,.0f} more than you have. "
+                    "tau is itself uncertain while the chains are short, so treat this as a minimum.")
+    tc = an["tau_curve"]
+    if tc is not None:
+        nm = tc["names"][0]
+        t_ = np.array(tc["tau"][nm], dtype=float)
+        if len(t_) >= 4 and np.isfinite(t_[-1]) and t_[-1] > 1.3 * np.nanmedian(t_[len(t_) // 2:len(t_) // 2 + 2]):
+            obs.append(f"tau of {nm} is still growing with the length of the chain ({t_[len(t_) // 2]:.0f} at half the post-burn-in length, {t_[-1]:.0f} at the end), so it has not levelled off.")
+    if an["flagged"]:
+        obs.append(f"{len(an['flagged'])} of {nE} cold chains are flagged ({', '.join('E' + str(i) + ' ' + ch[i]['flags'] for i in an['flagged'])}); see the Chains section.")
+    rh = [r["rhat"] for r in srow if np.isfinite(r["rhat"])]
+    if rh and max(rh) > 1.05:
+        tips.append("R-hat is above 1.05: the cold chains disagree. Look at the histograms per chain; a posterior with separate modes can look like this when chains sit in different ones.")
+    wasted = [c for c in an["checks"] if c["key"] == "learn" and c["status"] == "warn"]
+    if wasted:
+        tips.append("Some learning proposals are almost never accepted in the cold chain; try the cycle name with 'noKD' (or 'noGM') to drop them and save the time they cost per iteration.")
+    etf = an.get("etf")
+    if etf is not None and etf["remaining"] > 0:
+        obs.append(f"By the cold chains' own tau the run has about {an['counts']['n_est']:,.0f} of the {an['counts']['target']:,} samples asked for (bilby counts {an['counts']['n_now']:,.0f}); "
+                   f"finishing needs about {etf['rows']:,.0f} more rows, {etf['hours']:.1f} h at the present speed. bilby's own printed estimate assumes one chain makes all the remaining samples "
+                   f"({etf['bilby_hours']:.1f} h here), so with {nE} cold chains it reads too high.")
+    if not obs:
+        obs.append("Nothing stands out in the automated checks.")
+    if not tips:
+        tips.append("No action needed. As a final check, repeat the run with a different seed and compare the posteriors.")
+    return obs, tips
+
+
+# ============================================================================== plots
+
+def _col(E):
+    return plt.cm.tab10(E % 10)
+
+
+def _tname(T):
+    return f"T{T}"
+
+
+def plot_logl(run, an):
+    """ln L of the cold chains against the row, and the distribution of each chain after the burn-in"""
+    with _style():
+        fig, axs = plt.subplots(1, 2, figsize=(12.8, 4.3), gridspec_kw=dict(width_ratios=[2.3, 1]))
+        L = run.logl_cold()
+        n = L.shape[0]
+        idx = _plot_idx(n)
+        ax = axs[0]
+        for E in range(run.nE):
+            ax.plot(idx, L[idx, E], lw=0.7, alpha=0.7, color=_col(E), label=f"E{E}" if run.nE <= 8 else None)
+        ax.plot(idx, np.median(L, axis=1)[idx], color=C["ink"], lw=1.5, label="median of the cold chains")
+        ax.axvline(an["bilby_idx"], ls="--", color=C["burn"], lw=1.3, label=f"bilby's burn-in ({an['bilby_idx']:,})")
+        if an["est_found"] and an["est_idx"] > 0:
+            ax.axvline(an["est_idx"], ls=":", color=C["green"], lw=1.5, label=f"ln L plateau estimate ({an['est_idx']:,})")
+        elif an["est_found"]:
+            ax.plot([], [], ls=":", color=C["green"], label="ln L plateau reached within the first block")
+        lo, hi = _plateau_ylim(L[max(an["bi"], an["est_idx"]):])
+        ax.set_ylim(lo, hi)
+        ax.set_xlabel("row")
+        ax.set_ylabel("ln L")
+        ax.set_title("Log-likelihood of the cold chains")
+        ax.legend(ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.17), fontsize=8)
+        ax = axs[1]
+        post = L[an["bi"]:]
+        lo, hi = _plateau_ylim(post)
+        bins = np.linspace(lo, hi, 50)
+        for E in range(run.nE):
+            ax.hist(post[:, E], bins=bins, histtype="step", density=True, color=_col(E), lw=1.0, alpha=0.8)
+        ax.hist(post.reshape(-1), bins=bins, histtype="step", density=True, color=C["ink"], lw=1.8)
+        ax.set_xlabel("ln L (after the burn-in)")
+        ax.set_title("Per chain (colour) and pooled (black)")
+        fig.tight_layout()
+    return fig
+
+
+def plot_ladder(run, an):
+    """swap acceptance per pair (recorded and predicted), ln L distribution per temperature, and the ladder with its more even alternative"""
+    with _style():
+        fig, axs = plt.subplots(1, 3, figsize=(14.5, 4.4))
+        sw, nT = an["swaps"], run.nT
+        x = np.arange(nT - 1)
+        ax = axs[0]
+        ax.axhspan(0.2, 0.8, color=C["green"], alpha=0.10, lw=0)
+        ax.bar(x - 0.18, sw["recorded"], 0.36, color=C["blue"], label="recorded")
+        ax.bar(x + 0.18, sw["predicted"], 0.36, color=C["light"], label="predicted from the stored ln L")
+        if an.get("ladder_design") is not None:
+            ax.plot(x, an["ladder_design"]["predicted"], "o--", color=C["orange"], ms=4, lw=1.2, label="more even ladder (predicted)")
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{i}-{i + 1}" for i in x])
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("pair of temperatures")
+        ax.set_ylabel("swap acceptance")
+        ax.set_title("Swap acceptance (green: 0.2 to 0.8)")
+        ax.legend(fontsize=8, loc="upper left")
+        ax = axs[1]
+        L = an["lnl_by_T"]
+        for T in range(nT):
+            v = np.percentile(L[T], [5, 16, 50, 84, 95])
+            ax.plot([T, T], [v[0], v[4]], color=C["light"], lw=3)
+            ax.plot([T, T], [v[1], v[3]], color=C["blue"], lw=6, solid_capstyle="butt")
+            ax.plot([T], [v[2]], "o", color="white", ms=4, mec=C["ink"])
+        ax.set_xticks(range(nT))
+        ax.set_xticklabels([f"T{T}\n{run.betas[T]:.2f}" for T in range(nT)], fontsize=8)
+        ax.set_ylabel("ln L")
+        ax.set_title("ln L per temperature (5-95%, 16-84%, median)")
+        ax = axs[2]
+        ax.plot(range(nT), run.betas, "o-", color=C["blue"], label="this run")
+        if an.get("ladder_design") is not None:
+            ax.plot(range(nT), an["ladder_design"]["betas"], "o--", color=C["orange"], label="equal predicted acceptance")
+        ax.set_yscale("log")
+        ax.set_xlabel("temperature index")
+        ax.set_ylabel("beta = 1 / T")
+        ax.set_title("The ladder")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+    return fig
+
+
+def bilby_plot_burnin(run, an):
+    with _style():
+        fig = plt.figure(figsize=(12.5, 7.4))
+        gs = fig.add_gridspec(2, 3, height_ratios=[1.15, 1])
+        ax = fig.add_subplot(gs[0, :])
+        L = run.logl_cold()
+        n = L.shape[0]
+        med = np.median(L, axis=1)
+        idx = _plot_idx(n, 1500)
+        ax.plot(idx + 1, med[idx], color=C["blue"], lw=1.0, label="median ln L of the cold chains")
+        info = an["est_info"]
+        ax.axhline(info["ref"], color=C["green"], lw=1.0, ls="--", label="plateau")
+        ax.axhspan(info["ref"] - info["tol"], info["ref"] + info["tol"], color=C["green"], alpha=0.12, lw=0, label="tolerance")
+        ax.axvline(max(an["bilby_idx"], 1), color=C["burn"], ls="--", lw=1.3, label=f"bilby's burn-in ({an['bilby_idx']:,})")
+        if an["est_found"] and an["est_idx"] > 0:
+            ax.axvline(an["est_idx"], color=C["green"], ls=":", lw=1.5, label=f"plateau estimate ({an['est_idx']:,})")
+        elif an["est_found"]:
+            ax.plot([], [], color=C["green"], ls=":", label="plateau reached within the first block")
+        ax.set_xscale("log")
+        late = med[int(0.75 * n):]
+        sd = max(robust_sd(late), 1e-6)
+        ax.set_ylim(info["ref"] - 12 * max(sd, info["tol"]), info["ref"] + 5 * max(sd, info["tol"]))
+        ax.set_xlabel("row (log axis)")
+        ax.set_ylabel("ln L")
+        ax.set_title("Approach to the plateau")
+        ax.legend(ncol=3, fontsize=8, loc="lower right")
+        scan = an["burn_scan"]
+        if scan:
+            xs = [s["rows"] for s in scan]
+            specs = [("rhat", "worst R-hat (largest)", 1.01, 1.05, False), ("n_over_tau", "worst N / tau (smallest)", 50, 20, True), ("drift", "worst |drift z| (largest)", 3, 5, False)]
+            for k, (key, label, good, badv, hib) in enumerate(specs):
+                a2 = fig.add_subplot(gs[1, k])
+                ys = [s[key] for s in scan]
+                a2.plot(xs, ys, "o-", color=C["blue"])
+                a2.axhline(good, color=C["green"], ls="--", lw=1.1)
+                a2.axhline(badv, color=C["red"], ls=":", lw=1.3)
+                a2.set_xlabel("rows removed from the start")
+                a2.set_title(label, fontsize=10)
+                if key == "n_over_tau":
+                    a2.set_yscale("log")
+        fig.tight_layout()
+    return fig
+
+
+def plot_proposals(run, an):
+    """acceptance and scale of every proposal against the temperature"""
+    with _style():
+        fig, axs = plt.subplots(1, 2, figsize=(13, 4.4))
+        beta = run.betas
+        props = an["proposals"]
+        ax = axs[0]
+        for k, p in enumerate(props):
+            y = np.array(p["by_T"], dtype=float)
+            if np.isfinite(y).any():
+                ax.plot(beta, y, "o-", ms=3.5, lw=1.2, color=plt.cm.tab20(k % 20), label=f"{p['kind']} ({p['n']})")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.invert_xaxis()
+        ax.set_xlabel("beta (cold chain on the left)")
+        ax.set_ylabel("acceptance")
+        ax.set_title("Acceptance of each proposal")
+        ax.legend(fontsize=7, ncol=2)
+        ax = axs[1]
+        for k, p in enumerate(props):
+            y = np.array(p["scale"], dtype=float)
+            if np.isfinite(y).any():
+                ax.plot(beta, y, "o-", ms=3.5, color=plt.cm.tab20(k % 20), label=f"{p['kind']} ({p['n']})")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.invert_xaxis()
+        ax.set_xlabel("beta (cold chain on the left)")
+        ax.set_ylabel("scale")
+        ax.set_title("Scale of the adaptive Gaussian proposals")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8)
+        fig.tight_layout()
+    return fig
+
+
+def plot_steps(run, an):
+    sp = an["steps"]
+    if sp is None:
+        return None
+    with _style():
+        rows = sorted(sp["rows"], key=lambda r: r["share"] if np.isfinite(r["share"]) else 9)
+        fig, ax = plt.subplots(figsize=(8.5, 0.34 * len(rows) + 1.4))
+        y = np.arange(len(rows))
+        v = [100 * r["share"] for r in rows]
+        ax.barh(y, v, color=[C["red"] if s < 1 else C["amber"] if s < 5 else C["green"] for s in v])
+        ax.set_yticks(y)
+        ax.set_yticklabels([r["name"] for r in rows], fontsize=9)
+        ax.set_xscale("log")
+        ax.axvline(1, color=C["red"], ls=":", lw=1.3)
+        ax.axvline(5, color=C["green"], ls="--", lw=1.1)
+        ax.set_xlabel("one accepted adaptive-Gaussian step as a share of the posterior sd (%)")
+        ax.set_title(f"Step sizes of the cold chain (scale {sp['scale']:.4g})")
+        fig.tight_layout()
+    return fig
+
+
+def plot_walls(run, an):
+    wl = an["walls"]
+    if wl is None:
+        return None
+    with _style():
+        order = np.argsort(wl["share"])[::-1]
+        fig, ax = plt.subplots(figsize=(8.5, 0.34 * len(order) + 1.4))
+        colours = {"None": C["red"], "reflective": C["green"], "periodic": C["gray"]}
+        ax.barh(np.arange(len(order)), [100 * wl["share"][i] for i in order], color=[colours.get(wl["boundary"][i], C["amber"]) for i in order])
+        ax.set_yticks(np.arange(len(order)))
+        ax.set_yticklabels([f"{wl['names'][i]} ({wl['boundary'][i]})" for i in order], fontsize=9)
+        ax.invert_yaxis()
+        ax.set_xlabel("share of differential-evolution jumps that leave this parameter's prior (%)")
+        ax.set_title("Prior walls: red = no boundary (the jump is rejected), green = reflective (the jump is reflected back)")
+        fig.tight_layout()
+    return fig
+
+
+def plot_offsets(run, an):
+    with _style():
+        off = an["offsets"]
+        names = [r["name"] for r in an["params"] if not r["derived"]]
+        fig, ax = plt.subplots(figsize=(max(7, 0.55 * len(names) + 2), 0.5 * run.nE + 2.2))
+        lim = max(6.0, float(np.nanmax(np.abs(off))))
+        im = ax.imshow(off, aspect="auto", cmap="RdBu_r", vmin=-lim, vmax=lim)
+        ax.set_xticks(range(len(names)))
+        ax.set_xticklabels(names, rotation=60, ha="right", fontsize=8)
+        ax.set_yticks(range(run.nE))
+        ax.set_yticklabels([f"E{E}" for E in range(run.nE)])
+        ax.grid(False)
+        for E in range(run.nE):
+            for j in range(len(names)):
+                if abs(off[E, j]) > 3:
+                    ax.text(j, E, f"{off[E, j]:.0f}", ha="center", va="center", fontsize=7, color="white" if abs(off[E, j]) > 0.6 * lim else "black")
+        fig.colorbar(im, ax=ax, label="mean of the chain minus the pooled mean, in standard errors")
+        ax.set_title("Do the cold chains agree? (values above 5 are flagged)")
+        fig.tight_layout()
+    return fig
+
+
+def bilby_plot_traces(run, an, names, per_page=5):
+    pages = []
+    bi = an["bi"]
+    n = run.rows
+    cen = an["centres"]
+    X0 = run.stack(0, 0, run.centres(0), names=None, derived=True)
+    names = [k for k in names if k in X0]
+    idx = _plot_idx(n)
+    for s in range(0, len(names), per_page):
+        chunk = names[s:s + per_page]
+        with _style():
+            fig, axs = plt.subplots(len(chunk), 2, figsize=(13, 2.1 * len(chunk) + 0.5), gridspec_kw=dict(width_ratios=[3.4, 1]), squeeze=False)
+            for r, nm in enumerate(chunk):
+                x = X0[nm]
+                label = nm
+                if nm == "geocenter_time":
+                    x, label = (x - np.mean(x)) * 1e3, "geocenter_time - mean (ms)"
+                ax = axs[r, 0]
+                for E in range(run.nE):
+                    ax.plot(idx, x[idx, E], lw=0.6, alpha=0.7, color=_col(E))
+                ax.plot(idx, np.median(x, axis=1)[idx], color=C["ink"], lw=1.3)
+                ax.axvline(bi, color=C["burn"], ls="--", lw=1.2)
+                lo, hi = _robust_ylim(x[bi:])
+                ax.set_ylim(lo, hi)
+                ax.set_ylabel(label, fontsize=9)
+                if r == len(chunk) - 1:
+                    ax.set_xlabel("row")
+                post = x[bi:]
+                h = len(post) // 2
+                bins = np.linspace(lo, hi, 36)
+                ax = axs[r, 1]
+                ax.hist(post[:h].reshape(-1), bins=bins, density=True, histtype="step", color=C["blue"], lw=1.4)
+                ax.hist(post[h:].reshape(-1), bins=bins, density=True, histtype="step", color=C["orange"], lw=1.4)
+                ax.set_yticks([])
+            fig.tight_layout()
+        pages.append(fig)
+    return pages
+
+
+def bilby_plot_acf(run, an, nparam=6):
+    names = (an["tau_curve"] or {}).get("names") or [r["name"] for r in an["params"] if not r["derived"]][:nparam]
+    names = names[:nparam]
+    X = an["X"]
+    with _style():
+        fig, axs = plt.subplots(2, 3, figsize=(13, 6.2))
+        for ax, nm in zip(axs.ravel(), names):
+            x = _fill_nan(X[nm])
+            tau = integrated_autocorr_time(x)
+            K = int(min(len(x) - 1, max(60, 6 * (tau if np.isfinite(tau) else 50))))
+            for E in range(run.nE):
+                a, _ = mean_acf(x[:, [E]])
+                if a is not None:
+                    ax.plot(a[:K], lw=0.8, alpha=0.6, color=_col(E))
+            a, _ = mean_acf(x)
+            if a is not None:
+                ax.plot(a[:K], color=C["ink"], lw=1.7)
+            ax.axhline(0, color=C["gray"], lw=0.8)
+            if np.isfinite(tau) and tau < K:
+                ax.axvline(tau, color=C["burn"], ls="--", lw=1.1)
+            ax.set_title(f"{nm}: tau {tau:.0f}", fontsize=10)
+            ax.set_xlabel("lag (rows)")
+        for ax in axs.ravel()[len(names):]:
+            ax.axis("off")
+        fig.tight_layout()
+    return fig
+
+
+def plot_history(run, an):
+    """how n (bilby's count) and tau changed during the run, and tau against chain length as computed here"""
+    with _style():
+        fig, axs = plt.subplots(1, 3, figsize=(14.5, 4.1))
+        ax = axs[0]
+        if run.hist_n:
+            xs, ys = zip(*run.hist_n)
+            ax.plot(xs, ys, color=C["blue"])
+            if run.target:
+                ax.axhline(run.target, color=C["green"], ls="--", lw=1.1, label=f"target {run.target:,}")
+                ax.legend(fontsize=8)
+        ax.set_xlabel("row")
+        ax.set_ylabel("n (bilby's count over the cold chains)")
+        ax.set_title("Samples counted by bilby")
+        ax = axs[1]
+        tau_hist = [(p, t) for p, t in run.hist_tau if np.isfinite(t)]
+        if tau_hist:
+            xs, ys = zip(*tau_hist)
+            ax.plot(xs, ys, color=C["orange"])
+            ax.set_yscale("log")
+        ax.set_xlabel("row")
+        ax.set_ylabel("max tau over the parameters (rows)")
+        ax.set_title("tau as bilby saw it (primary chain)")
+        ax = axs[2]
+        tc = an["tau_curve"]
+        if tc is not None:
+            for k, nm in enumerate(tc["names"]):
+                ax.plot(tc["N"], tc["tau"][nm], "o-", ms=3, lw=1.2, label=nm)
+            ax.plot(tc["N"], tc["N"] / 50.0, "k--", lw=1.0, label="N / 50")
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.legend(fontsize=7, ncol=2)
+        ax.set_xlabel("rows of the chain used")
+        ax.set_ylabel("tau (rows)")
+        ax.set_title("tau against chain length (after the burn-in)")
+        fig.tight_layout()
+    return fig
+
+
+def plot_tau_by_T(run, an):
+    sampled = [r["name"] for r in an["params"] if not r["derived"]]
+    M = np.array([[an["tau_by_T"][T][k] for T in range(run.nT)] for k in sampled], dtype=float)
+    with _style():
+        fig, axs = plt.subplots(1, 2, figsize=(13, 0.34 * len(sampled) + 2.2), gridspec_kw=dict(width_ratios=[1.6, 1]))
+        ax = axs[0]
+        im = ax.imshow(np.log10(np.maximum(M, 1.0)), aspect="auto", cmap="viridis_r")
+        ax.set_xticks(range(run.nT))
+        ax.set_xticklabels([f"T{T}\n{run.betas[T]:.2f}" for T in range(run.nT)], fontsize=8)
+        ax.set_yticks(range(len(sampled)))
+        ax.set_yticklabels(sampled, fontsize=8)
+        ax.grid(False)
+        for i in range(M.shape[0]):
+            for j in range(M.shape[1]):
+                if np.isfinite(M[i, j]):
+                    ax.text(j, i, f"{M[i, j]:.0f}", ha="center", va="center", fontsize=7, color="white" if np.log10(max(M[i, j], 1)) < 0.5 * np.nanmax(np.log10(np.maximum(M, 1))) else "black")
+        fig.colorbar(im, ax=ax, label="log10 tau (rows)")
+        ax.set_title("tau of every parameter at every temperature")
+        ax = axs[1]
+        d = an["tau_dir_by_T"]
+        ax.plot(range(run.nT), [d[T] for T in range(run.nT)], "o-", color=C["orange"], label="slowest direction")
+        ax.plot(range(run.nT), np.nanmax(M, axis=0), "s--", color=C["blue"], label="slowest parameter")
+        ax.set_yscale("log")
+        ax.set_xticks(range(run.nT))
+        ax.set_xticklabels([f"T{T}" for T in range(run.nT)])
+        ax.set_ylabel("tau (rows)")
+        ax.set_title("tau against temperature")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+    return fig
+
+
+def plot_slow_direction(run, an):
+    sd = an["slow_dirs"]
+    with _style():
+        fig, axs = plt.subplots(1, len(sd), figsize=(5.2 * len(sd), 0.3 * len(sd[0]["loadings"]) + 1.8), squeeze=False)
+        for ax, d in zip(axs[0], sd):
+            items = sorted(d["loadings"].items(), key=lambda kv: abs(kv[1]))
+            ax.barh([k for k, _ in items], [v for _, v in items], color=[C["blue"] if v > 0 else C["orange"] for _, v in items])
+            ax.axvline(0, color=C["gray"], lw=0.8)
+            ax.set_title(f"tau {d['tau']:.0f} rows", fontsize=10)
+            ax.tick_params(axis="y", labelsize=8)
+        fig.suptitle("Slowest directions of the posterior (loadings on the standardised parameters)", fontsize=11, fontweight="bold")
+        fig.tight_layout()
+    return fig
+
+
+def plot_hist(run, an, names=None, ncols=4):
+    X = an["X"]
+    names = names or [r["name"] for r in an["params"] if not r["derived"]]
+    names = [k for k in names if k in X]
+    nr = int(np.ceil(len(names) / ncols))
+    with _style():
+        fig, axs = plt.subplots(nr, ncols, figsize=(3.2 * ncols, 2.3 * nr), squeeze=False)
+        for ax, nm in zip(axs.ravel(), names):
+            x = X[nm]
+            label = nm
+            if nm == "geocenter_time":
+                x, label = (x - np.mean(x)) * 1e3, "geocenter_time - mean (ms)"
+            lo, hi = _robust_ylim(x.reshape(-1), 0.2, 99.8, 0.02)
+            bins = np.linspace(lo, hi, 40)
+            for E in range(run.nE):
+                ax.hist(x[:, E], bins=bins, density=True, histtype="step", color=_col(E), lw=0.8, alpha=0.8)
+            ax.hist(x.reshape(-1), bins=bins, density=True, histtype="step", color=C["ink"], lw=1.6)
+            ax.set_title(label, fontsize=9)
+            ax.set_yticks([])
+            ax.tick_params(axis="x", labelsize=8)
+        for ax in axs.ravel()[len(names):]:
+            ax.axis("off")
+        fig.tight_layout()
+    return fig
+
+
+# ============================================================================== HTML report
+
+def _status_cls(v, ok, warn, higher=False):
+    return _status(v, ok, warn, higher)
+
+
+def _bilby_explorer_payload(run, an, max_pts=500):
+    """the data of the interactive trace explorer (the same layout as in the emcee report: the cold chains play the part of the walkers)"""
+    n = run.rows
+    idx = _plot_idx(n, max_pts)
+    X = run.stack(0, 0, run.centres(0), derived=True)
+    X["ln_likelihood"] = np.column_stack([run.arrays[(0, E)][:n, run.il] for E in range(run.nE)])
+    flagged = [int(i) for i in an["flagged"]]
+    walkers = flagged + [E for E in range(run.nE) if E not in flagged]
+    series = {}
+    for nm, x in X.items():
+        x = np.asarray(x, dtype=np.float64)
+        q = _nanq(x[idx], [0.05, 0.16, 0.5, 0.84, 0.95], axis=1)
+        series[nm] = {"q": [_sig(r) for r in q], "w": [_sig(x[idx, E]) for E in walkers]}
+    return {"steps": [int(v) for v in idx], "burn": int(an["bi"]), "walkers": walkers, "n_flagged": len(flagged), "series": series}
+
+
+def _fnum(x, spec=".4g"):
+    if x is None or not np.isfinite(x):
+        return "n/a"
+    return format(x, spec)
+
+
+def _bilby_params_table(an):
+    head = ["parameter", "mean", "std", "5%", "median", "95%", "R-hat", "tau", "tau per chain (min - max)", "N/tau", "ESS", "drift z", "status"]
+    out = ['<div class="scroll"><table class="sortable"><thead><tr>' + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
+    for r in an["params"]:
+        nm = r["name"] + (" (derived)" if r["derived"] else "")
+        out.append("<tr>" + _cell(nm) + _cell(_fmt(r["mean"]), val=r["mean"]) + _cell(_fmt(r["std"]), val=r["std"]) + _cell(_fmt(r["q05"]), val=r["q05"]) + _cell(_fmt(r["q50"]), val=r["q50"]) +
+                   _cell(_fmt(r["q95"]), val=r["q95"]) + _cell(_fmt(r["rhat"]), r["st_rhat"], r["rhat"]) + _cell(_fmt(r["tau"]), val=r["tau"]) +
+                   _cell(f"{_fmt(r['tau_min'])} - {_fmt(r['tau_max'])}", val=r["tau_max"]) + _cell(_fmt(r["n_over_tau"]), r["st_tau"], r["n_over_tau"]) +
+                   _cell(_fmt(r["ess"]), r["st_ess"], r["ess"]) + _cell(_fmt(r["drift_z"]), r["st_drift"], r["drift_z"]) + _cell(r["status"].upper(), r["status"]) + "</tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def _chains_table(an):
+    head = ["chain", "flags", "median ln L", "offset from the others (spreads)", "max ln L", "slowest tau (rows)", "of", "n (tau-based, bilby's counting)", "largest offset of a mean (std. errors)", "of",
+            "bilby's burn-in (row)", "by", "local acceptance"]
+    out = ['<div class="scroll"><table class="sortable"><thead><tr>' + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
+    for c in an["chains"]:
+        cls = "bad" if c["flags"] else ""
+        out.append("<tr>" + _cell(f"E{c['id']}", val=c["id"]) + _cell(c["flags"] or "-", cls) + _cell(_fmt(c["median_lnl"]), val=c["median_lnl"]) + _cell(f"{c['gap']:+.2f}", val=c["gap"]) +
+                   _cell(_fmt(c["max_lnl"]), val=c["max_lnl"]) + _cell(_fmt(c["tau_max"]), val=c["tau_max"]) + _cell(c["tau_param"]) + _cell(_fmt(c["n_eff"]), val=c["n_eff"]) +
+                   _cell(_fmt(c["offset_max"]), "bad" if c["offset_max"] > 5 else "", c["offset_max"]) + _cell(c["offset_param"]) + _cell(f"{c['burn']:,}", val=c["burn"]) + _cell(c["burn_method"]) +
+                   _cell(f"{c['local_accept']:.3f}", val=c["local_accept"]) + "</tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def _temps_table(run, an):
+    head = ["T", "beta", "1 / beta", "swap to the next (recorded)", "predicted", "ln L median", "ln L sd", "slowest parameter tau", "slowest direction tau", "AG scale", "AG acceptance", "DE acceptance"]
+    out = ['<div class="scroll"><table class="sortable"><thead><tr>' + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
+    ag = next((p for p in an["proposals"] if p["kind"] == "AG" and p["n"] == len(run.names)), None)
+    de = next((p for p in an["proposals"] if p["kind"] == "DE" and p["n"] == len(run.names)), None)
+    rec, pred = an["swaps"]["recorded"], an["swaps"]["predicted"]
+    for T in range(run.nT):
+        L = an["lnl_by_T"][T]
+        tmax = max((v for v in an["tau_by_T"][T].values() if np.isfinite(v)), default=float("nan"))
+        r_ = rec[T] if T < len(rec) else float("nan")
+        cls = ("ok" if 0.2 <= r_ <= 0.8 else "warn" if r_ >= 0.1 else "bad") if np.isfinite(r_) else ""
+        out.append("<tr>" + _cell(f"T{T}", val=T) + _cell(f"{run.betas[T]:.4f}", val=run.betas[T]) + _cell(f"{1 / run.betas[T]:.3f}", val=1 / run.betas[T]) + _cell(_fnum(r_, ".3f"), cls, r_) +
+                   _cell(_fnum(pred[T] if T < len(pred) else float("nan"), ".3f")) + _cell(_fmt(float(np.median(L))), val=float(np.median(L))) + _cell(_fmt(float(np.std(L))), val=float(np.std(L))) +
+                   _cell(_fmt(tmax), val=tmax) + _cell(_fmt(an["tau_dir_by_T"][T]), val=an["tau_dir_by_T"][T]) + _cell(_fnum(ag["scale"][T] if ag else float("nan")), val=ag["scale"][T] if ag else None) +
+                   _cell(_fnum(ag["by_T"][T] if ag else float("nan"), ".3f")) + _cell(_fnum(de["by_T"][T] if de else float("nan"), ".3f")) + "</tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def _proposals_table(run, an):
+    head = ["#", "proposal", "parameters", "weight", "proposals made (cold chain)"] + [f"T{T} ({run.betas[T]:.2f})" for T in range(run.nT)]
+    out = ['<div class="scroll"><table class="sortable"><thead><tr>' + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
+    for p in an["proposals"]:
+        cells = []
+        for a in p["by_T"]:
+            cls = ""
+            if p["kind"] in ("KDE", "GMM") and np.isfinite(a) and a < 0.005 and p["count"] > 2000:
+                cls = "warn"
+            cells.append(_cell(_fnum(a, ".3f") if np.isfinite(a) else "n/a", cls, a))
+        out.append("<tr>" + _cell(p["index"], val=p["index"]) + _cell(p["kind"]) + _cell(p["n"], val=p["n"]) + _cell(_fnum(p["weight"], "g"), val=p["weight"]) + _cell(f"{p['count']:,}", val=p["count"]) + "".join(cells) + "</tr>")
+    out.append("</tbody></table></div>")
+    if an["stretch"] is not None:
+        out.append(f'<p class="muted">The ensemble stretch move (between the chains of one temperature, every {run.L2} iterations): accepted {100 * an["stretch"]["acc"]:.1f}% of {an["stretch"]["count"]:,} proposals, '
+                   "counted over all chains.</p>")
+    return "".join(out)
+
+
+def _steps_table(an):
+    sp = an["steps"]
+    if sp is None:
+        return ""
+    head = ["parameter", "prior width used", "sigma_i", "step of one accepted move", "posterior sd", "step / sd", "status"]
+    out = ['<div class="scroll"><table class="sortable"><thead><tr>' + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>"]
+    for r in sorted(sp["rows"], key=lambda r: r["share"] if np.isfinite(r["share"]) else 9):
+        st = _status(r["share"], 0.05, 0.01, True)
+        out.append("<tr>" + _cell(r["name"]) + _cell(_fmt(r["width"]), val=r["width"]) + _cell(_fmt(r["sigma"]), val=r["sigma"]) + _cell(_fmt(r["step"]), val=r["step"]) + _cell(_fmt(r["post_sd"]), val=r["post_sd"]) +
+                   _cell(f"{100 * r['share']:.2f}%", st, r["share"]) + _cell({"ok": "OK", "warn": "CHECK", "bad": "SMALL", "na": "n/a"}[st], st) + "</tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def _widths_json(an):
+    sampled = [r for r in an["params"] if not r["derived"]]
+    return json.dumps({r["name"]: float(f"{r['std']:.3g}") for r in sampled})
+
+
+def _bilby_stat_guide_html():
+    rows = [("R-hat", "Do the cold chains describe the same distribution? Compares the spread between chains with the spread inside each chain; it is 1 when they agree.", "close to 1, below 1.01", "above 1.05"),
+            ("N / tau", "How long a cold chain is in units of the autocorrelation time tau, the number of rows it needs to forget where it was. Roughly the number of independent samples per chain.", "50 or more", "below 20"),
+            ("drift z", "Has the chain stopped moving? The difference between the averages of the first and second half of the chain, in standard errors.", "within about 3 (random scatter around 0)", "above 5"),
+            ("swap acceptance", "How often two neighbouring temperatures exchange their states. Too low: the hot chains cannot feed the cold one. Too high: the temperatures are closer than they need to be.", "0.2 to 0.8", "below 0.1")]
+    out = ['<table><thead><tr><th>statistic</th><th style="text-align:left">what it tells you</th><th>good</th><th>worrying</th></tr></thead><tbody>']
+    for name, what, good, bad in rows:
+        out.append(f'<tr><td><b>{name}</b></td><td style="text-align:left;white-space:normal">{what}</td><td class="ok">{good}</td><td class="bad">{bad}</td></tr>')
+    out.append("</tbody></table>")
+    return "".join(out)
+
+
+def _arg_table(rows, head=("setting", "what it is", "value")):
+    t = ['<table class="args"><colgroup><col style="width:27%"><col style="width:40%"><col style="width:33%"></colgroup>' f"<thead><tr><th>{head[0]}</th><th>{head[1]}</th><th>{head[2]}</th></tr></thead><tbody>"]
+    for a, m, v in rows:
+        t.append(f"<tr><td>{_html.escape(str(a))}</td><td>{_html.escape(str(m))}</td><td>{_html.escape(str(v))}</td></tr>")
+    t.append("</tbody></table>")
+    return "".join(t)
+
+
+def _bilby_fmt_arg(v):
+    if isinstance(v, (list, tuple)):
+        return " ".join(_bilby_fmt_arg(x) for x in v)
+    if isinstance(v, bool) or v is None:
+        return str(v)
+    if isinstance(v, float):
+        return f"{v:.10g}"
+    return str(v)
+
+
+def _settings_section(run, an, arguments=None, command_line=None, sampler_kwargs=None):
+    out = ['<section id="settings"><h2>Settings</h2><p class="muted">Read from the resume file: what bilby_mcmc was set up with, and what the run did so far.</p>']
+    cv, pi = run.conv, run.ptin
+    ladder = [("ntemps", "temperatures in the ladder", pi.get("ntemps", run.nT)), ("nensemble", "chains per temperature (the cold ones give the samples)", pi.get("nensemble", run.nE)),
+              ("pt_ensemble", "an ensemble at every temperature (False: only at the cold one)", pi.get("pt_ensemble")), ("Tmax", "hottest temperature asked for", pi.get("Tmax")),
+              ("Tmax_from_SNR", "hottest temperature chosen as SNR^2 / ndim for this SNR", pi.get("Tmax_from_SNR")), ("initial_betas", "starting betas, if given", pi.get("initial_betas")),
+              ("adapt", "adapt the ladder (at the start of the run; it stops after adapt_t0 x 10 rows)", pi.get("adapt")), ("adapt_t0", "adaptation time scale", pi.get("adapt_t0")),
+              ("adapt_nu", "adaptation rate", pi.get("adapt_nu")), ("adapting now", "is the ladder still being adapted", run.adapting)]
+    out.append("<h3>Parallel tempering</h3>" + _arg_table([(a, m, _bilby_fmt_arg(v)) for a, m, v in ladder]))
+    steps = [("L1steps", "internal steps of a chain per stored row (one iteration)", run.L1), ("L2steps", "iterations between temperature swaps (and ensemble moves)", run.L2),
+             ("target_nsamples", "samples asked for", cv.get("target_nsamples")), ("burn_in_nact", "burn-in in autocorrelation times", cv.get("burn_in_nact")),
+             ("thin_by_nact", "samples are one per thin_by_nact x tau rows", cv.get("thin_by_nact")), ("autocorr_c", "Sokal window factor for tau", cv.get("autocorr_c")),
+             ("fixed_discard", "rows always discarded", cv.get("fixed_discard")), ("min_tau", "smallest tau used", cv.get("min_tau")), ("fixed_tau", "tau fixed by the user", cv.get("fixed_tau")),
+             ("tau_window", "tau from the last tau_window x tau rows", cv.get("tau_window")), ("stop_after_convergence", "stop stepping a chain once it has enough samples", cv.get("stop_after_convergence")),
+             ("evidence_method", "", getattr(run.pt, "evidence_method", None)), ("initial_sample_method", "", getattr(run.pt, "initial_sample_method", None))]
+    out.append("<h3>Counting and stopping</h3>" + _arg_table([(a, m, _bilby_fmt_arg(v)) for a, m, v in steps]))
+    t = an["time"]
+    prog = [("rows per chain", "stored rows (steps of one chain are L1steps per row, plus an extra row per ensemble move)", f"{run.rows:,}"), ("iterations", "swap rounds x L2steps", f"{run.iterations:,}"),
+            ("rows per iteration", "above 1 because of the ensemble rows", f"{run.rows_per_iter:.3f}"), ("swap rounds", "", f"{run.swap_rounds:,}"),
+            ("sampling time", "", f"{t['hours']:.2f} h"), ("time per iteration", "wall time, all chains in parallel", f"{t['per_iteration']:.2f} s"),
+            ("time per internal step", "", f"{t['per_step_ms']:.1f} ms"), ("sampled parameters", "", f"{len(run.names)}: " + ", ".join(run.names)),
+            ("burn-in", "bilby's last cut for each cold chain", _methods_text(run) + f"; the largest cut is row {an['bilby_idx']:,}")]
+    out.append("<h3>Progress</h3>" + _arg_table(prog))
+    ag = _first(run.sd[0][0], "AdaptiveGaussianProposal")
+    if ag is not None:
+        rows = []
+        for k in run.names:
+            if k in ag.prior_minimum_dict:
+                rows.append((k, f"boundary: {ag.prior_boundary_dict.get(k)}", f"{_bilby_fmt_arg(float(ag.prior_minimum_dict[k]))} to {_bilby_fmt_arg(float(ag.prior_maximum_dict[k]))} (width {_bilby_fmt_arg(float(ag.prior_width_dict[k]))})"))
+        out.append("<h3>Priors as the proposals see them</h3><p class=\"muted\">The range, the width that scales the adaptive Gaussian steps (an infinite prior counts as 1) and the boundary rule of every sampled parameter.</p>"
+                   + _arg_table(rows, head=("parameter", "boundary", "range")))
+    cyc = [f"{_kind(p)} ({len(getattr(p, 'parameters', []))} parameters, weight {getattr(p, 'weight', '?')})" for p in run.sd[0][0].proposal_cycle.proposal_list]
+    out.append("<h3>Proposal cycle of every chain</h3><p class=\"muted\">" + _html.escape("; ".join(cyc)) + "</p>")
+    d = None
+    if arguments is not None:
+        d = dict(vars(arguments)) if hasattr(arguments, "__dict__") else dict(arguments)
+    if d:
+        out.append('<h3>Arguments of run_sampler.py</h3><p class="muted">The arguments the run was started with, as parsed (defaults included).</p>' + _arg_table([("--" + k.replace("_", "-"), "", _bilby_fmt_arg(v)) for k, v in sorted(d.items())]))
+        cmd = command_line or "python run_sampler.py " + " ".join(f"--{k.replace('_', '-')} {_bilby_fmt_arg(v)}" if not isinstance(v, bool) else (f"--{k.replace('_', '-')}" if v else "") for k, v in d.items() if v not in (None, False))
+        out.append(f'<details><summary>Command line {"" if command_line else "(reconstructed from the parsed arguments)"}</summary><pre class="cmd">{_html.escape(cmd)}</pre></details>')
+    if sampler_kwargs:
+        out.append('<h3>Sampler keyword arguments</h3><pre class="cmd">' + _html.escape(json.dumps(sampler_kwargs, indent=2, default=str)) + "</pre>")
+    out.append("</section>")
+    return "".join(out)
+
+
+def _swap_rows(sc):
+    names = {"bad": "NOT carried forward", "ok": "carried forward", "na": "not conclusive"}
+    cls = {"bad": "bad", "ok": "ok", "na": ""}
+    out = []
+    for i, s in enumerate(sc):
+        share = "n/a" if not np.isfinite(s["share"]) else f"{100 * s['share']:.0f}%"
+        out.append(f'<tr><td>E{i}</td><td>{s["jumps"]}</td><td>{100 * s["frac"]:.1f}%</td><td>{share}</td><td class="{cls[s["verdict"]]}">{names[s["verdict"]]}</td></tr>')
+    return "".join(out)
+
+
+def bilby_build_report(run, out_path, an=None, title=None, burn="bilby", trace_pages=True, explorer=True, dpi=110, arguments=None, command_line=None, sampler_kwargs=None, verbose=False, **analysis_kwargs):
+    """Analyse `run` and write a self-contained HTML report (images embedded, no internet needed). Returns the analysis dict."""
+    t0 = time.time()
+    an = an or bilby_analyze(run, burn=burn, verbose=verbose, **analysis_kwargs)
+    title = title or f"bilby_mcmc diagnostics: {os.path.basename(run.path)}"
+    verdict_text = {"ok": "No red flags in the automated checks", "warn": "Some checks need attention", "bad": "Problems detected: do not trust these chains yet", "na": "Not enough information"}[an["verdict"]]
+    sampled = [r for r in an["params"] if not r["derived"]]
+    cts = an["counts"]
+    taus = [r["tau"] for r in sampled if np.isfinite(r["tau"])]
+    rec = an["swaps"]["recorded"]
+    cards = [("iterations", f"{run.iterations:,}"), ("rows per chain", f"{run.rows:,}"), ("chains", f"{run.nT} x {run.nE}", "temperatures x chains per temperature"),
+             ("sampling time", f"{an['time']['hours']:.1f} h"), ("samples n (bilby)", f"{_fnum(cts['n_now'], ',.0f')}" + (f" / {cts['target']:,}" if cts["target"] else ""), "bilby's own count over the cold chains and the target"),
+             ("analysed from row", f"{an['bi']:,}"), ("slowest tau", f"{max(taus):,.0f} rows" if taus else "n/a"), ("min N / tau", _fnum(min((r["n_over_tau"] for r in sampled if np.isfinite(r["n_over_tau"])), default=np.nan), ".0f")),
+             ("swap acceptance", f"{min(rec):.2f} - {max(rec):.2f}" if rec else "n/a"), ("round trip", f"{an['swaps']['round_trip_iterations']:,.0f} it.", "iterations for a replica to go hot -> cold -> hot"),
+             ("flagged chains", f"{len(an['flagged'])}")]
+    cards_html = "".join(f'<div class="card" title="{_html.escape(c[2]) if len(c) > 2 else ""}"><div class="k">{c[0]}</div><div class="v">{c[1]}</div></div>' for c in cards)
+
+    def badge(s):
+        return f'<span class="badge b-{s}">{ {"ok": "OK", "warn": "CHECK", "bad": "PROBLEM", "na": "n/a"}[s] }</span>'
+
+    def dot(s):
+        label = {"ok": "good", "warn": "check", "bad": "problem", "na": "not available"}[s]
+        return f'<span class="dot b-{s}" title="{label}" aria-label="{label}"></span>'
+
+    legend_html = ('<div class="legend"><span><i class="dot b-ok"></i> good</span><span><i class="dot b-warn"></i> check</span><span><i class="dot b-bad"></i> problem</span><span><i class="dot b-na"></i> not available</span></div>')
+    checks_html = legend_html + ('<table class="checks"><colgroup><col style="width:24%"><col style="width:9%"><col style="width:32%"><col style="width:35%"></colgroup>'
+                                 '<thead><tr><th>check</th><th>status</th><th>result</th><th>what counts as good</th></tr></thead><tbody>' +
+                                 "".join(f'<tr><td data-l="check"><b>{_html.escape(c["label"])}</b></td><td data-l="status">{dot(c["status"])}</td><td data-l="result">{_html.escape(c["value"])}</td>'
+                                         f'<td data-l="good" class="muted">{_html.escape(c["rule"])}</td></tr>' for c in an["checks"]) + "</tbody></table>")
+    diag_html = ("<h3>Reading this run</h3><ul>" + "".join(f"<li>{_html.escape(t)}</li>" for t in an["diagnosis"]) + "</ul><h3>What to try</h3><ul>" + "".join(f"<li>{_html.escape(t)}</li>" for t in an["suggestions"]) + "</ul>")
+    secs = []
+    secs.append(f'<section id="overview"><h2>Overview</h2><p class="muted">Generated {time.strftime("%Y-%m-%d %H:%M")} from <code>{_html.escape(run.path)}</code>.</p>'
+                f'<div class="verdict {an["verdict"]}">{badge(an["verdict"])}<strong>{verdict_text}</strong></div><div class="cards">{cards_html}</div>{diag_html}{checks_html}'
+                '<p class="muted" style="margin-top:12px">Automated checks are heuristics. They can reveal problems but cannot prove convergence; see <a href="#methods">Methods</a>. '
+                "One row of a chain is one iteration of L1steps internal steps, so tau in rows times L1steps is tau in steps of the sampler.</p></section>")
+    secs.append(_settings_section(run, an, arguments, command_line, sampler_kwargs))
+    secs.append('<section id="lnl"><h2>Log-likelihood</h2><p class="muted">The cold chains should climb to, and then fluctuate around, the same plateau. Dashed purple: the burn-in bilby used; dotted green: where the median ln L reaches its plateau.</p>'
+                + _img(plot_logl(run, an), "log-likelihood", dpi) + "</section>")
+    ld = an.get("ladder_design")
+    swaps_txt = (f"A replica needs about {an['swaps']['round_trip_rounds']:.0f} swap rounds for a round trip from the hottest to the coldest chain and back "
+                 f"({an['swaps']['round_trip_rows']:,.0f} rows, {an['swaps']['round_trip_iterations']:,.0f} iterations), estimated by simulating swaps with the recorded acceptances.")
+    design = ""
+    if ld is not None:
+        design = ('<h3>A more even ladder</h3><p class="muted">Same number of temperatures and same hottest temperature, spaced so that the predicted swap acceptance is the same in every pair '
+                  f'({ld["target"]:.2f}); the prediction reweights the stored ln L of the nearest chain and was checked against the recorded acceptances above. Round trip with it: about {ld["round_trip_rounds"]:.0f} swap rounds.</p>'
+                  f'<pre class="cmd">"initial_betas": [{", ".join(f"{b:.4f}" for b in ld["betas"])}], "adapt": false</pre>')
+    elif an.get("ladder_design_error"):
+        design = f'<p class="muted">The ladder design could not be made: {_html.escape(an["ladder_design_error"])}</p>'
+    sc = an["swap_check"]
+    sc_rows = _swap_rows(sc)
+    secs.append('<section id="temperatures"><h2>Temperatures and swaps</h2><p class="muted">Parallel tempering: hot chains cross barriers easily and hand their states down to the cold chain through swaps. '
+                "The swap acceptance of every pair should be roughly even; the predicted values come from the stored ln L and should match the recorded ones.</p>"
+                + _img(plot_ladder(run, an), "ladder and swaps", dpi) + f'<p class="muted">{swaps_txt}</p><h3>Per temperature</h3>' + _temps_table(run, an) + design
+                + '<h3>Do the swaps move the chains?</h3><p class="muted">After a swap the cold chain\'s stored row jumps to the state it received. If the chain then continues from that state the next row stays near it; '
+                  "if the swap only rewrote the stored row, the next row returns to the chain's own old state. The share of such returns among the jumps is about 100% when the swaps do nothing and low when they work. "
+                  "Large moves made by the proposals themselves (KDE, mixture) can blur the test.</p>"
+                + '<table><thead><tr><th>chain</th><th>jumps</th><th>share of rows</th><th>next row returns</th><th>reading</th></tr></thead><tbody>' + sc_rows + "</tbody></table></section>")
+    bi_ = an["est_info"]
+    scan_rows = "".join(f"<tr><td>{100 * s['frac']:.0f}%</td><td>{s['rows']:,}</td>{_cell(_fnum(s['rhat'], '.3f'), _status(s['rhat'], 1.01, 1.05), s['rhat'])}{_cell(_fnum(s['n_over_tau'], '.1f'), _status(s['n_over_tau'], 50, 20, True), s['n_over_tau'])}"
+                        f"{_cell(_fnum(s['drift'], '.1f'), _status(s['drift'], 3, 5), s['drift'])}</tr>" for s in an["burn_scan"])
+    burn_src = "bilby's cut" if an["burn_choice"] == "bilby" else str(an["burn_choice"])
+    burn_para = ('<p class="muted">bilby removes rows by the largest of several rules: <b>FD</b> a fixed number, <b>10tau</b> burn_in_nact x tau, <b>z1</b> until the running ln posterior is within ndim/2 of its maximum, '
+                 "<b>AD</b> the last temperature adaptation, <b>PR</b> a learning proposal. Here: " + _html.escape(_methods_text(run)) + f"; the cut is row {an['bilby_idx']:,} ({100 * an['bilby_idx'] / run.rows:.0f}% of the run). "
+                 f"The statistics in this report use the part from row {an['bi']:,} ({_html.escape(burn_src)}).</p>")
+    secs.append('<section id="burnin"><h2>Burn-in</h2><p class="muted">Top: the approach of ln L to its plateau on a log axis. Bottom: the three convergence statistics recomputed after removing the first part of the run. '
+                "If a statistic keeps improving as more rows are removed, the chains have not forgotten their start.</p>"
+                + burn_para
+                + _bilby_stat_guide_html() + _img(bilby_plot_burnin(run, an), "burn-in", dpi)
+                + '<h3>Statistics versus rows removed</h3><table><thead><tr><th>removed</th><th>rows</th><th>worst R-hat</th><th>worst N / tau</th><th>worst |drift z|</th></tr></thead><tbody>' + scan_rows + "</tbody></table></section>")
+    secs.append('<section id="chains"><h2>Chains</h2><p class="muted">The cold chains (temperature 0) are the ensemble that gives the posterior. Click a column header to sort. A chain is flagged if its ln L is more than 3 robust spreads below the others '
+                "and at least 1 unit lower than the best, if its slowest tau is more than 3 times the median and over 100 rows, or if some parameter's mean is more than 5 standard errors from the pooled mean.</p>"
+                + _chains_table(an) + "<h3>Do the cold chains agree?</h3>" + _img(plot_offsets(run, an), "chain offsets", dpi) + "</section>")
+    walls_img = _img(plot_walls(run, an), "prior walls", dpi) if an["walls"] is not None else ""
+    steps_img = _img(plot_steps(run, an), "step sizes", dpi) if an["steps"] is not None else ""
+    secs.append('<section id="proposals"><h2>Proposals</h2><p class="muted">What every chain proposes during its L1steps internal steps, and how well the proposals work at each temperature. Acceptance of a learning proposal (KDE, mixture) below 0.5% is shown in amber.</p>'
+                + _proposals_table(run, an) + _img(plot_proposals(run, an), "proposals", dpi)
+                + '<h3>Step sizes</h3><p class="muted">bilby\'s adaptive Gaussian proposal moves parameter i by scale x (prior width) x sigma_i x N(0,1) (equation 7 of the bilby-MCMC paper); the bilby cycles leave every sigma_i at 1, '
+                  "so one shared scale, adapted to a 23% acceptance, serves all parameters. The table compares the step with the posterior width of each parameter in the cold chains.</p>" + steps_img + _steps_table(an)
+                + '<p class="muted">Posterior widths from these chains, for <code>"tdinf_posterior_width"</code> of the tdinf_scaled, tdinf_blocks and tdinf_gw cycles (circular parameters are measured after unwrapping):</p>'
+                  f'<pre class="cmd">"tdinf_posterior_width": {_html.escape(_widths_json(an))}</pre>'
+                + '<h3>Prior walls</h3><p class="muted">Differential-evolution jumps x + gamma (a - b), with a and b random samples of the cold chains and bilby\'s distribution of gamma, tested against the prior ranges. A jump that leaves a prior with no boundary rule is '
+                  "rejected before the likelihood is evaluated; a reflective boundary reflects it back (exact for diagonal steps such as the adaptive Gaussian, but it can bias the posterior near the walls for the correlated jumps of differential evolution and Fisher proposals), a periodic one wraps it (exact for any symmetric jump).</p>" + walls_img + "</section>")
+    tr = ['<section id="traces"><h2>Traces</h2>']
+    if explorer:
+        payload = json.dumps(_bilby_explorer_payload(run, an), separators=(",", ":")).replace("</", "<\\/")
+        tr.append('<p class="muted">Interactive explorer: bands are the 68% and 90% ranges across the cold chains, black is their median, grey lines are the chains, red lines flagged chains. The dashed line marks the burn-in.</p>'
+                  '<div class="explorer"><div class="controls"><label>parameter <select id="ex-param"></select></label><label><input type="checkbox" id="ex-bands" checked> bands</label>'
+                  '<label><input type="checkbox" id="ex-walkers" checked> chains</label><label><input type="checkbox" id="ex-flagged" checked> flagged chains</label>'
+                  '<label><input type="checkbox" id="ex-all"> include burn-in in the y-range</label></div><canvas id="ex-canvas" height="380"></canvas><div id="ex-tip" class="tip"></div></div>'
+                  f'<script id="ex-data" type="application/json">{payload}</script><script>{_EXPLORER_JS}</script>')
+    if trace_pages:
+        names = [r["name"] for r in an["params"]]
+        tr.append(f"<h3>Static trace plots</h3><p class=\"muted\">All {len(names)} parameters (derived ones included). Coloured lines: the cold chains; black: their median; purple dashed: the burn-in. "
+                  "Right-hand panels compare the first (blue) and second (orange) half of the chains after the burn-in: they should coincide.</p>")
+        for k, fig in enumerate(bilby_plot_traces(run, an, names, per_page=5)):
+            tr.append(_img(fig, f"traces page {k + 1}", dpi))
+    tr.append("</section>")
+    secs.append("".join(tr))
+    sd0 = an["slow_dirs"][0]
+    secs.append('<section id="convergence"><h2>Convergence and autocorrelation</h2><p class="muted">N/tau above 50 is the primary criterion; R-hat between the cold chains is a supporting check. tau is in rows.</p>'
+                "<h3>How n and tau developed</h3>" + _img(plot_history(run, an), "history", dpi) + "<h3>Autocorrelation function</h3>" + _img(bilby_plot_acf(run, an), "autocorrelation function", dpi)
+                + "<h3>Per-parameter statistics</h3>" + _bilby_params_table(an)
+                + '<h3>tau at every temperature</h3><p class="muted">A tau that is much larger in the cold chain than one temperature up points to the local moves of the cold chain; a similar tau everywhere points to the swaps.</p>' + _img(plot_tau_by_T(run, an), "tau by temperature", dpi)
+                + '<h3>Slowest directions</h3><p class="muted">Principal directions of the standardised cold-chain samples, ranked by the tau of their projection. A slow combination of parameters is what limits the run, not any one of them.</p>'
+                + _img(plot_slow_direction(run, an), "slow directions", dpi) + "</section>")
+    secs.append('<section id="posteriors"><h2>Posteriors</h2><p class="muted">Histograms after the burn-in: black pools the cold chains, colours are the individual chains. Chains that sit in different places or in different modes show up here before R-hat flags them.</p>'
+                + _img(plot_hist(run, an), "histograms", dpi) + "</section>")
+    secs.append('<section id="methods"><h2>Methods and caveats</h2><details open><summary>What is computed</summary><ul>'
+                "<li><b>Chains.</b> Every chain in the resume file; the cold ones (beta = 1, one per ensemble member) are analysed as the ensemble. The pickle is read with a restricted loader: nothing in it is run.</li>"
+                "<li><b>Burn-in.</b> By default bilby's own last cut (the largest over the cold chains), because the early rows would spoil tau and R-hat; the Burn-in section shows what the statistics look like for other cuts, and the ln L plateau estimate (as in the emcee report).</li>"
+                "<li><b>tau.</b> emcee-style integrated autocorrelation time: the autocorrelation of each cold chain, averaged over the chains and integrated with Sokal's window (c = 5), in rows. ESS = chains x N / tau. "
+                "bilby itself computes tau per chain and takes the maximum over parameters; the table also gives the range over the chains.</li>"
+                "<li><b>R-hat.</b> Rank-normalised split R-hat (bulk and folded tail), the larger of the two, between the cold chains.</li>"
+                "<li><b>Angles.</b> Phase, right ascension, polarization (folded onto a period of pi: psi and psi + pi give the same signal) and the spin azimuths are unwrapped around their circular mean before any statistic.</li>"
+                "<li><b>Swap prediction.</b> The ln L of the chain with the closest beta is importance-reweighted to the beta wanted and the swap acceptance E[min(1, exp((b1 - b2)(L2 - L1)))] is averaged over 500 x 500 quantile points.</li>"
+                "<li><b>Round trip.</b> A replica is followed through swaps drawn with the recorded acceptances, pairs tried in order from the cold end.</li>"
+                "<li><b>Time to finish.</b> The remaining samples divided by the rate at which the cold chains make independent samples (one per thin_by_nact x tau rows each), at the present time per iteration. "
+                "bilby's printed estimate multiplies by the primary chain's tau only, so with several cold chains it reads too high.</li></ul></details>"
+                "<details><summary>Caveats</summary><ul><li>The cold chains of an ensemble are not independent runs, so R-hat between them is a heuristic; N / tau is the primary criterion.</li>"
+                "<li>A posterior with separate modes can look converged if no chain visits the other mode. Parallel tempering helps, but only if the hot chains reach the mode; compare the temperatures in the tables above.</li>"
+                "<li>The swap test looks for jumps of the stored state; with large moves from learning proposals it can be inconclusive.</li>"
+                "<li>Where the file lacks a number (an old pickle, a run with a different layout) the corresponding check shows n/a.</li></ul></details></section>")
+    nav = "".join(f'<a href="#{i}">{t}</a>' for i, t in (("overview", "Overview"), ("settings", "Settings"), ("lnl", "Log-likelihood"), ("temperatures", "Temperatures"), ("burnin", "Burn-in"), ("chains", "Chains"),
+                                                          ("proposals", "Proposals"), ("traces", "Traces"), ("convergence", "Convergence"), ("posteriors", "Posteriors"), ("methods", "Methods")))
+    page = (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_html.escape(title)}</title><style>{_CSS}</style></head><body>'
+            f'<header><h1>{_html.escape(title)}</h1><p>{run.iterations:,} iterations, {run.nT} temperatures x {run.nE} chains, {len(run.names)} sampled parameters</p></header>'
+            f'<div class="layout"><nav>{nav}</nav><main>{"".join(secs)}</main></div><footer>report generated in {time.time() - t0 + an["seconds"]:.0f} s by sampler_diagnostics.py</footer><script>{_SORT_JS}</script></body></html>')
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(page)
+    print(f"wrote {out_path} ({len(page) / 1e6:.1f} MB) in {time.time() - t0 + an['seconds']:.0f} s; verdict: {an['verdict']}")
+    return an
+
+
+# ============================================================================== run_sampler integration and command line
+
+def _bilby_print_summary(an):
+    print(f"verdict: {an['verdict']}")
+    for c in an["checks"]:
+        print(f"  [{c['status']:4s}] {c['label']}: {c['value']}")
+
+
+def _bilby_parse_burn(b):
+    if b in ("bilby", "estimated"):
+        return b
+    try:
+        v = float(b)
+    except ValueError:
+        raise SystemExit("--burn must be bilby, estimated, a number of rows or a fraction")
+    return v if "." in str(b) and 0 < v < 1 else int(v)
+
+
+def report_from_pickle(path, out_path=None, burn="bilby", drop_rows_mod=None, arguments=None, command_line=None, sampler_kwargs=None, title=None, safe=False, **build_kw):
+    """Write the HTML report for a bilby_mcmc resume pickle. The report goes to <pickle without .pickle>_diagnostics.html unless out_path is given."""
+    def _go():
+        pt = load(path)
+        run = BilbyRun(pt, path, drop=drop_rows_mod)
+        out = out_path or re.sub(r"\.pickle$", "", str(path)) + "_diagnostics.html"
+        an = bilby_build_report(run, out, burn=burn, arguments=arguments, command_line=command_line, sampler_kwargs=sampler_kwargs, title=title, **build_kw)
+        _bilby_print_summary(an)
+        return an
+    if not safe:
+        return _go()
+    try:
+        return _go()
+    except Exception as e:                                     # a diagnostics problem must not break the run that called this
+        print(f"WARNING: the diagnostics report could not be made: {type(e).__name__}: {e}")
+        return None
+
+
+def bilby_report_from_args(args, kwargs=None, sampler_kwargs=None, pickle_path=None, out_path=None, safe=True, **build_kw):
+    """
+    Write the diagnostics report for a tdinf bilby_mcmc run from run_sampler.py's own `args` (the same call as for emcee runs).
+    The resume file is <outdir>/<label>_resume.pickle with outdir and label taken from args.output unless pickle_path is given; the report goes to
+    <output without .h5/.dat>_diagnostics.html unless out_path is given. safe=True (default): any error is printed as a warning and None is returned.
+    """
+    out = str(args.output)
+    base = os.path.splitext(out)[0]
+    path = pickle_path or os.path.join(os.path.dirname(out) or ".", os.path.basename(base) + "_resume.pickle")
+    if not os.path.isfile(path):
+        print(f"NOTE: no resume file {path}; bilby may have removed it when the run finished, so no diagnostics report was made")
+        return None
+    return report_from_pickle(path, out_path or base + "_diagnostics.html", arguments=args, sampler_kwargs=sampler_kwargs or kwargs, safe=safe, **build_kw)
+
+
+def bilby_main(argv=None):
+    ap = argparse.ArgumentParser(description="Diagnostics of a bilby_mcmc run from its resume pickle, as one self-contained HTML report.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=_BILBY_DOC)
+    ap.add_argument("pickle", help="<label>_resume.pickle")
+    ap.add_argument("-o", "--out", default=None, help="report to write (default: <pickle>_diagnostics.html)")
+    ap.add_argument("--burn", default="bilby", help="where the statistics start: bilby (its own cut), estimated (ln L plateau), a number of rows, or a fraction of the run")
+    ap.add_argument("--drop-rows-mod", default=None, help="M:R, leave out the rows whose index is R mod M (an old run whose swaps did not carry the state forward: 4:1)")
+    ap.add_argument("--no-explorer", action="store_true", help="leave out the interactive trace explorer")
+    ap.add_argument("--no-trace-pages", action="store_true", help="leave out the static trace plots (smaller file)")
+    ap.add_argument("--dpi", type=int, default=110)
+    ap.add_argument("--posterior-widths", action="store_true", help="only print the posterior widths as JSON for the tdinf_scaled / tdinf_blocks / tdinf_gw cycles")
+    ap.add_argument("--swaps-only", action="store_true", help="only print the swap check")
+    ap.add_argument("--verbose", action="store_true")
+    a = ap.parse_args(argv)
+    drop = tuple(int(x) for x in a.drop_rows_mod.split(":")) if a.drop_rows_mod else None
+    burn = _bilby_parse_burn(a.burn)
+    if a.posterior_widths or a.swaps_only:
+        run = BilbyRun(load(a.pickle), a.pickle, drop=drop)
+        bi = choose_burn(run, burn)
+        if a.posterior_widths:
+            X = run.stack(0, bi, run.centres(bi), derived=False)
+            print('"tdinf_posterior_width": ' + json.dumps({k: float(f"{np.std(v):.3g}") for k, v in X.items()}))
+        if a.swaps_only:
+            for i, s in enumerate(swap_check(run, bi)):
+                print(f"ensemble {i}: {s['jumps']} jump rows ({100 * s['frac']:.1f}% of rows); the next row returns to the pre-jump state in "
+                      f"{'n/a' if not np.isfinite(s['share']) else format(100 * s['share'], '.0f') + '%'} -> {s['verdict']}")
+        return
+    report_from_pickle(a.pickle, a.out, burn=burn, drop_rows_mod=drop, explorer=not a.no_explorer, trace_pages=not a.no_trace_pages, dpi=a.dpi, verbose=a.verbose)
+
+
+# ==============================================================================================================================================
+# PART 3: the dispatcher and Eryn (the cold chain through the emcee report, plus the tempering analysis)
+# ==============================================================================================================================================
+SUPPORTED = ("emcee", "eryn", "bilby_mcmc")
+
+
+# ============================================================================== the dispatcher
+def backend_path(args):
+    """The HDF5 backend of emcee and Eryn runs: --output if it ends in .h5, else --output with .h5 (as run_emcee and run_eryn name it)."""
+    out = str(args.output)
+    return out if out.endswith(".h5") else os.path.splitext(out)[0] + ".h5"
+
+
+def default_out_path(args):
+    return os.path.splitext(str(args.output))[0] + "_diagnostics.html"
+
+
+def run(sampler_name, args, kwargs=None, sampler_kwargs=None, samples=None, ln_posterior=None, out_path=None, safe=True, **options):
+    """
+    Write the diagnostics report of the sampler called `sampler_name` ("emcee", "eryn" or "bilby_mcmc").
+
+    args, kwargs, sampler_kwargs : what run_sampler gave the sampler (the files it wrote are found from args.output); samples and ln_posterior (what the sampler returned) are
+    accepted for the samplers that may use them and are not needed by the three above. out_path : the report (default <output without extension>_diagnostics.html).
+    options go to the sampler's report: for emcee and eryn burn, thin, max_points, max_steps (default 20000), title, spin_model, physical; for bilby_mcmc burn, trace_pages,
+    explorer, dpi, drop_rows_mod. Returns the analysis dictionary, or None when there is no report. safe=True: errors are printed, not raised.
+    """
+    name = str(sampler_name).lower()
+    handlers = dict(emcee=emcee_report, eryn=eryn_report, bilby_mcmc=bilby_mcmc_report)
+    if name not in handlers:
+        print(f"NOTE: there are no sampler diagnostics for {sampler_name!r} yet (available: {', '.join(SUPPORTED)})")
+        return None
+    t0 = time.time()
+    print(f"writing the {name} diagnostics report ...", flush=True)
+    result = handlers[name](args, kwargs=kwargs, sampler_kwargs=sampler_kwargs, out_path=out_path or default_out_path(args), safe=safe, **options)
+    if result is not None:
+        print(f"diagnostics done in {time.time() - t0:.0f} s")
+    return result
+
+
+def emcee_report(args, kwargs=None, sampler_kwargs=None, out_path=None, safe=True, max_steps=20000, **options):
+    """The emcee report (the module's own report_from_args)."""
+    args = copy.copy(args)
+    args.output_h5 = getattr(args, "output_h5", None) or backend_path(args)
+    return report_from_args(args, kwargs=kwargs, out_path=out_path or default_out_path(args), safe=safe, max_steps=max_steps, **options)
+
+
+def bilby_mcmc_report(args, kwargs=None, sampler_kwargs=None, out_path=None, safe=True, **options):
+    """The bilby_mcmc report, from <outdir>/<label>_resume.pickle."""
+    return bilby_report_from_args(args, kwargs=kwargs, sampler_kwargs=sampler_kwargs, out_path=out_path or default_out_path(args), safe=safe, **options)
+# ============================================================================== reading an Eryn backend
+def _h5_attr(obj, key):
+    try:
+        return obj.attrs[key]
+    except Exception:                                   # a file copied or killed while it was written can have attributes that cannot be read
+        return None
+
+
+def _last_filled(ds, n):
+    """Number of rows that hold data (rows never written are all zeros: Eryn grows its datasets ahead of the run)."""
+    if n < 1:
+        return 0
+    filled = lambda i: bool(np.any(np.asarray(ds[i]) != 0))
+    if filled(n - 1):
+        return int(n)
+    if not filled(0):
+        return 0
+    lo, hi = 0, n - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if filled(mid) else (lo, mid)
+    return int(lo + 1)
+
+
+def _find_chain(f, h5, branch=None):
+    names = []
+
+    def visit(name, obj):
+        try:
+            if isinstance(obj, h5.Dataset) and "chain" in name.split("/") and len(obj.shape) == 5:
+                names.append(name)
+        except Exception:
+            pass
+
+    f.visititems(visit)
+    names = sorted(names)
+    if branch is not None:
+        names = [n for n in names if n.endswith("/" + branch)]
+    if not names:
+        raise ValueError("no chain dataset (steps, temperatures, walkers, leaves, parameters) in the file: is it an Eryn backend?")
+    cname = names[0]
+    return cname, (cname.split("/chain/")[0] if "/chain/" in cname else "")
+
+
+def eryn_file_info(path, branch=None):
+    """(ndim, ntemps, nwalkers, steps written) of an Eryn backend, cheaply."""
+    import h5py
+    with h5py.File(path, "r") as f:
+        cname, group = _find_chain(f, h5py, branch)
+        ch = f[cname]
+        n_alloc, T, W, L, D = ch.shape
+        it = _h5_attr(f[group] if group else f, "iteration")
+        n = min(int(it), n_alloc) if it is not None else n_alloc
+        n = _last_filled(ch, n)
+    return dict(ndim=int(D), ntemps=int(T), nwalkers=int(W), n_steps=int(n))
+
+
+def read_eryn_backend(path, names=None, max_steps=20000, max_temp_rows=3000, max_pop_rows=1500, max_pop_bytes=4e8, n_tail=1000, block_steps=2000, branch=None):
+    """
+    Read an Eryn HDF5 backend for the report. Returns a dict with
+      run               a Run (PART 1) of the COLD chain (temperature 0, ln p = ln likelihood + ln prior), read with a stride when the run has more than max_steps steps
+      ll_T, betas_T     the log likelihood of every temperature (rows, T, W) and the betas (rows, T), at steps_T (a stride keeping at most max_temp_rows rows)
+      chain_P           the chain of every temperature (rows, T, W, D, float32, the Run's column offsets removed) at steps_P (at most max_pop_rows rows and max_pop_bytes)
+      swaps_accepted, accepted, moves    the counters of the backend (or None), moves: name -> acceptance fraction (T, W)
+      and the sizes, the Eryn version, and what was dropped. Rows that were never written, or that cannot be read, are not used.
+    """
+    import h5py
+    notes = []
+    with h5py.File(path, "r") as f:
+        cname, group = _find_chain(f, h5py, branch)
+        join = lambda k: f"{group}/{k}" if group else k
+        ch = f[cname]
+        n_alloc, T, W, L, D = ch.shape
+        if L != 1:
+            raise ValueError(f"{cname} has {L} leaves per walker: tdinf runs have one")
+        gobj = f[group] if group else f
+        it = _h5_attr(gobj, "iteration")
+        n = min(int(it), n_alloc) if it is not None else n_alloc
+        n_written = _last_filled(ch, n)
+        if n_written < n:
+            notes.append(f"the last {n - n_written:,} step(s) were never written (all zeros; a copy made while the run was writing): they are not used")
+            n = n_written
+        if n < 8:
+            raise ValueError(f"only {n} steps in the backend")
+        ll_ds, lp_ds = f[join("log_like")], f[join("log_prior")]
+        stride = max(int(np.ceil(n / float(max_steps))), 1) if max_steps else 1
+        steps = np.arange(0, n, stride)
+        offsets = _column_offsets(ch[0:min(200, n), 0, :, 0, :])
+        x = np.empty((len(steps), W, D), dtype=np.float32)
+        lnp = np.empty((len(steps), W), dtype=np.float32)
+        blk = max(stride, (block_steps // stride) * stride)
+        k = 0
+        for b0 in range(0, n, blk):
+            b1 = min(b0 + blk, n)
+            c = np.asarray(ch[b0:b1:stride, 0, :, 0, :], dtype=np.float64) - offsets
+            lp = np.asarray(ll_ds[b0:b1:stride, 0], dtype=np.float64) + np.asarray(lp_ds[b0:b1:stride, 0], dtype=np.float64)
+            x[k:k + len(c)], lnp[k:k + len(c)] = c, lp
+            k += len(c)
+        t0 = max(0, n - n_tail)
+        tail_x = (np.asarray(ch[t0:n, 0, :, 0, :], dtype=np.float64) - offsets).astype(np.float32)
+        tail_lnp = (np.asarray(ll_ds[t0:n, 0], dtype=np.float64) + np.asarray(lp_ds[t0:n, 0], dtype=np.float64)).astype(np.float32)
+        # counters
+        def get(key):
+            try:
+                return np.asarray(f[join(key)][()])
+            except Exception:
+                return None
+        swaps, accepted = get("swaps_accepted"), get("accepted")
+        moves = {}
+        try:
+            for mname in f[join("moves")].keys():
+                try:
+                    moves[mname] = np.asarray(f[join(f"moves/{mname}/acceptance_fraction")][()], dtype=float)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if moves:
+            first = moves[sorted(moves)[0]]
+            acc0 = first[0]
+        elif accepted is not None and accepted.ndim == 2:
+            acc0 = accepted[0] / max(n, 1)
+        else:
+            acc0 = None
+        # all temperatures: log likelihood and ladder at a stride, the chain at a coarser one
+        s2 = max(int(np.ceil(n / float(max_temp_rows))), 1)
+        steps_T = np.arange(0, n, s2)
+        ll_T = np.asarray(ll_ds[0:n:s2], dtype=np.float32)
+        betas_T = None
+        try:
+            betas_T = np.asarray(f[join("betas")][0:n:s2], dtype=float)
+        except Exception:
+            notes.append("the backend has no betas: the ladder is not shown")
+        s3 = max(int(np.ceil(n / float(max_pop_rows))), int(np.ceil(n * T * W * D * 4 / float(max_pop_bytes))), 1)
+        steps_P = np.arange(0, n, s3)
+        chain_P = np.empty((len(steps_P), T, W, D), dtype=np.float32)
+        kk, step_blk = 0, max(s3, (max(block_steps // 4, 1) // s3) * s3)
+        for b0 in range(0, n, step_blk):
+            b1 = min(b0 + step_blk, n)
+            c = np.asarray(ch[b0:b1:s3, :, :, 0, :], dtype=np.float64) - offsets
+            chain_P[kk:kk + len(c)] = c
+            kk += len(c)
+        version = _h5_attr(gobj, "version")
+        version = version.decode() if isinstance(version, bytes) else (str(version) if version is not None else "?")
+    note = _thin_note(stride, "limit" if stride > 1 else "", n, max_steps)
+    run_ = Run(x, lnp, steps, n, names=names, tail_x=tail_x, tail_lnp=tail_lnp, accepted=acc0, source=str(path), offsets=offsets, thin_note=note)
+    print(f"read {path}: {n} steps x {T} temperatures x {W} walkers x {D} parameters; cold chain stride {stride} -> {len(steps)} rows; "
+          f"all temperatures: ln L at stride {s2} ({len(steps_T)} rows), chain at stride {s3} ({len(steps_P)} rows)")
+    return dict(run=run_, path=str(path), n_steps=int(n), ntemps=int(T), nwalkers=int(W), ndim=int(D), version=version, stride=stride, notes=notes, offsets=offsets,
+                steps_T=steps_T, ll_T=ll_T, betas_T=betas_T, stride_T=s2, steps_P=steps_P, chain_P=chain_P, stride_P=s3,
+                swaps_accepted=None if swaps is None else np.asarray(swaps, dtype=float).reshape(-1), accepted=accepted, moves=moves)
+
+
+# ============================================================================== the tempering analysis
+def _eryn_fmt(v, spec=".3g"):
+    return "n/a" if v is None or not np.isfinite(v) else format(v, spec)
+
+
+def _table(head, rows, cls=""):
+    """An HTML table: head is a list of titles, rows a list of lists of (text) or (text, css class)."""
+    out = [f'<div class="scroll"><table class="{cls}"><thead><tr>' + "".join(f"<th>{_html.escape(h)}</th>" for h in head) + "</tr></thead><tbody>"]
+    for r in rows:
+        out.append("<tr>" + "".join(_cell(c[0], c[1]) if isinstance(c, tuple) else _cell(c) for c in r) + "</tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def _st_cls(status):
+    return status if status in ("ok", "warn", "bad") else ""
+
+
+def predicted_swap_acceptance(ll_T, betas_T, rows, rng=None):
+    """
+    The swap acceptance that the stored log likelihoods predict for each adjacent pair: the mean over the given rows of min(1, exp((beta_k - beta_k+1) (lnL_k+1 - lnL_k)))
+    with the walkers of the two temperatures paired at random. This needs no counter, so it also shows what a ladder WOULD do. Returns an array of T - 1 values.
+    """
+    rng = rng or np.random.default_rng(0)
+    L, B = np.asarray(ll_T[rows], dtype=float), np.asarray(betas_T[rows], dtype=float)
+    R, T, W = L.shape
+    out = np.empty(T - 1)
+    for k in range(T - 1):
+        perm = rng.random((R, W)).argsort(axis=1)
+        a = np.take_along_axis(L[:, k + 1, :], perm, axis=1) - L[:, k, :]
+        d = (B[:, k] - B[:, k + 1])[:, None]
+        out[k] = float(np.mean(np.minimum(1.0, np.exp(np.clip(d * a, -50, 50)))))
+    return out
+
+
+def population_tau(chain_P, rows, stride_P):
+    """
+    For every temperature and parameter: the autocorrelation time, in steps, of the ensemble mean (the mean over walkers at each step); the half-vs-half drift of that mean in
+    standard errors (z); and the shift of the ensemble mean between the two halves in units of the parameter's own spread over all walkers and steps (shift).
+    The shift does not depend on the autocorrelation time. z does, and a series with a trend has a long autocorrelation time because of that trend, which makes z small
+    however large the drift: z alone can reassure falsely. chain_P (rows, T, W, D); rows selects the steps. Returns tau, z, shift, each (T, D); nan where the series is too short.
+    """
+    X = np.asarray(chain_P[rows], dtype=np.float64)
+    R, T, W, D = X.shape
+    tau, z, shift = (np.full((T, D), np.nan) for _ in range(3))
+    if R < 8:
+        return tau, z, shift
+    h = R // 2
+    for t in range(T):
+        M = X[:, t, :, :].mean(axis=1)
+        spread = X[:, t, :, :].reshape(-1, D).std(axis=0)
+        for j in range(D):
+            s = M[:, j:j + 1]
+            tr = integrated_autocorr_time(s, 5.0)
+            if np.isfinite(tr):
+                tau[t, j] = tr * stride_P
+                z[t, j] = drift_z(s, tr)
+            if spread[j] > 0:
+                shift[t, j] = (M[h:2 * h, j].mean() - M[:h, j].mean()) / spread[j]
+    return tau, z, shift
+
+
+def _fig_ladder(E, pred, measured):
+    T = E["ntemps"]
+    with _style():
+        fig, ax = plt.subplots(1, 2, figsize=(11.5, 3.9), gridspec_kw=dict(width_ratios=[1.35, 1]))
+        if E["betas_T"] is not None:
+            temps = 1.0 / np.maximum(E["betas_T"], 1e-12)
+            for k in range(T):
+                ax[0].plot(E["steps_T"], temps[:, k], lw=1.4, label=f"T{k}")
+            ax[0].set_yscale("log")
+            ax[0].legend(ncol=min(T, 5), loc="upper center", bbox_to_anchor=(0.5, -0.2))
+        else:
+            ax[0].text(0.5, 0.5, "no betas in the backend", ha="center", va="center", transform=ax[0].transAxes)
+        ax[0].set_xlabel("step")
+        ax[0].set_ylabel("temperature 1 / beta")
+        ax[0].set_title("Temperature ladder")
+        x = np.arange(T - 1)
+        w = 0.38
+        ax[1].axhspan(0.2, 0.5, color=C["green"], alpha=0.10, lw=0)
+        if measured is not None:
+            ax[1].bar(x - w / 2, measured, w, color=C["blue"], label="measured (counters)")
+        if pred is not None:
+            ax[1].bar(x + (w / 2 if measured is not None else 0), pred, w if measured is not None else 0.6, color=C["orange"], label="predicted from ln L")
+        ax[1].set_xticks(x)
+        ax[1].set_xticklabels([f"T{k}-T{k + 1}" for k in range(T - 1)])
+        ax[1].set_ylim(0, 1)
+        ax[1].set_ylabel("swap acceptance")
+        ax[1].set_title("Swap acceptance per pair")
+        ax[1].legend(loc="upper right")
+        fig.tight_layout()
+    return fig
+
+
+def _fig_lnl(E, start, nb=60):
+    T, steps, L = E["ntemps"], E["steps_T"], E["ll_T"]
+    post = steps >= start
+    with _style():
+        fig, ax = plt.subplots(1, 2, figsize=(11.5, 3.9), gridspec_kw=dict(width_ratios=[1.35, 1]))
+        edges = np.linspace(0, len(steps), min(nb, max(len(steps) // 4, 2)) + 1).astype(int)
+        cen = np.array([steps[edges[i]:max(edges[i + 1], edges[i] + 1)].mean() for i in range(len(edges) - 1)])
+        meds = []
+        for k in range(T):
+            m = np.array([np.nanmedian(L[edges[i]:max(edges[i + 1], edges[i] + 1), k]) for i in range(len(edges) - 1)])
+            lo = np.array([np.nanpercentile(L[edges[i]:max(edges[i + 1], edges[i] + 1), k], 16) for i in range(len(edges) - 1)])
+            hi = np.array([np.nanpercentile(L[edges[i]:max(edges[i + 1], edges[i] + 1), k], 84) for i in range(len(edges) - 1)])
+            ax[0].plot(cen, m, lw=1.5, label=f"T{k}")
+            ax[0].fill_between(cen, lo, hi, alpha=0.15, lw=0)
+            meds.append(m)
+        floor = np.nanpercentile(np.concatenate(meds), 2) if meds else 0
+        top = np.nanmax(np.concatenate(meds)) if meds else 1
+        ax[0].set_ylim(floor - 0.1 * (top - floor), top + 0.1 * (top - floor))
+        if start > 0:
+            ax[0].axvline(start, color=C["burn"], ls="--", lw=1.3)
+        ax[0].set_xlabel("step")
+        ax[0].set_ylabel("ln likelihood (median, 16-84%)")
+        ax[0].set_title("ln L of every temperature")
+        ax[0].legend(ncol=min(T, 5), loc="lower right")
+        if post.sum() > 4:
+            allv = L[post].reshape(-1)
+            bins = np.linspace(np.nanpercentile(allv, 0.5), np.nanpercentile(allv, 99.5), 70)
+            for k in range(T):
+                v = L[post][:, k].reshape(-1)
+                ax[1].hist(v[np.isfinite(v)], bins=bins, density=True, histtype="step", lw=1.6, label=f"T{k}")
+        ax[1].set_xlabel("ln likelihood after the burn-in")
+        ax[1].set_ylabel("density")
+        ax[1].set_title("Overlap of neighbouring temperatures")
+        fig.tight_layout()
+    return fig
+
+
+def _fig_moves(E):
+    moves, T = E["moves"], E["ntemps"]
+    if not moves:
+        return None
+    with _style():
+        fig, ax = plt.subplots(figsize=(8.5, 3.6))
+        names = sorted(moves)
+        w = 0.8 / len(names)
+        for i, nm in enumerate(names):
+            ax.bar(np.arange(T) + (i - (len(names) - 1) / 2) * w, np.nanmean(moves[nm], axis=1), w, label=nm)
+        ax.axhspan(0.2, 0.5, color=C["green"], alpha=0.10, lw=0)
+        ax.set_xticks(np.arange(T))
+        ax.set_xticklabels([f"T{k}" for k in range(T)])
+        ax.set_ylabel("acceptance fraction (mean over walkers)")
+        ax.set_title("Move acceptance at every temperature")
+        ax.legend()
+        fig.tight_layout()
+    return fig
+
+
+def _fig_population(E, params, labels, start):
+    steps, X, T = E["steps_P"], E["chain_P"], E["ntemps"]
+    k = len(params)
+    ncols = 3 if k > 4 else 2
+    nrows = int(np.ceil(k / ncols))
+    with _style():
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 2.7 * nrows), squeeze=False)
+        for a, j, lab in zip(axes.ravel(), params, labels):
+            for t in range(T):
+                a.plot(steps, X[:, t, :, j].astype(float).mean(axis=1), lw=1.1, label=f"T{t}")
+            if start > 0:
+                a.axvline(start, color=C["burn"], ls="--", lw=1.1)
+            a.set_title(lab, fontsize=10)
+            a.set_xlabel("step")
+        for a in axes.ravel()[k:]:
+            a.set_visible(False)
+        axes.ravel()[0].legend(ncol=min(T, 5), fontsize=8)
+        fig.tight_layout()
+    return fig
+
+
+def make_eryn_extras(E, dpi=110):
+    """The `extras` callable of build_report (PART 1) for an Eryn backend read by read_eryn_backend."""
+    def extras(run, an):
+        T, W, n = E["ntemps"], E["nwalkers"], E["n_steps"]
+        start = int(an["est_step"]) if an["est_found"] else int(0.5 * n)
+        start_note = ("the estimated burn-in of the cold chain" if an["est_found"] else "half of the run (no ln p plateau was found)")
+        betas, stepsT, LL = E["betas_T"], E["steps_T"], E["ll_T"]
+        post_T = np.where(stepsT >= start)[0]
+        if len(post_T) < 8:
+            post_T = np.arange(len(stepsT) // 2, len(stepsT))
+        checks, obs, tips, sections_html = [], [], [], []
+        # ---- ladder
+        final_T = None
+        ladder_html = ""
+        if betas is not None:
+            final_T = 1.0 / np.maximum(betas[-1], 1e-12)
+        if betas is not None and T > 1:
+            fr = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
+            idx = [min(int(round(f * (len(stepsT) - 1))), len(stepsT) - 1) for f in fr]
+            rows = [[f"{int(stepsT[i]):,}"] + [_eryn_fmt(1.0 / max(betas[i, k], 1e-12), ".3f") for k in range(T)] for i in idx]
+            ladder_html = _table(["step"] + [f"T{k}" for k in range(T)], rows)
+            q = int(0.75 * (len(stepsT) - 1))
+            rel = np.abs(betas[-1] - betas[q]) / np.maximum(np.abs(betas[q]), 1e-12)
+            rel[0] = 0.0
+            worst = int(np.argmax(rel))
+            checks.append(dict(key="ladder", label="Temperature ladder settled", status=_status(float(rel.max()), 0.02, 0.05),
+                               value=f"largest change of a beta over the last quarter of the run: {100 * rel.max():.1f}% (T{worst})",
+                               rule="Good if no beta changes by more than 2% over the last quarter of the run; check up to 5%. The adaptive ladder keeps moving until adaptation stops."))
+            if rel.max() >= 0.02:
+                tips.append("The temperature ladder is still adapting at the end of the run. Stop the adaptation once it has settled (the stop_adaptation entry of tempering_kwargs), "
+                            "so that the last part of the chain is sampled with a fixed ladder.")
+        # ---- swap acceptance
+        measured = None
+        if E["swaps_accepted"] is not None and len(E["swaps_accepted"]) == T - 1:
+            measured = E["swaps_accepted"] / float(n * W)
+        pred = predicted_swap_acceptance(LL, betas, post_T) if (betas is not None and T > 1 and len(post_T) >= 4) else None
+        both = measured if measured is not None else pred
+        pairs_rows = []
+        if both is not None:
+            for k in range(T - 1):
+                m_, p_ = (measured[k] if measured is not None else None), (pred[k] if pred is not None else None)
+                st = _status(both[k], 0.15, 0.05, True)
+                pairs_rows.append([f"T{k} - T{k + 1}", _eryn_fmt(final_T[k], ".3f") if final_T is not None else "n/a", _eryn_fmt(final_T[k + 1], ".3f") if final_T is not None else "n/a",
+                                   (_eryn_fmt(m_, ".3f"), _st_cls(st) if measured is not None else ""), (_eryn_fmt(p_, ".3f"), _st_cls(st) if measured is None else ""),
+                                   _eryn_fmt(p_ / m_, ".2f") if (m_ and p_ is not None) else "n/a"])
+            lo_, hi_ = float(np.min(both)), float(np.max(both))
+            src = "measured" if measured is not None else "predicted from ln L"
+            checks.append(dict(key="swap", label="Swap acceptance of every pair", status=_status(lo_, 0.15, 0.05, True),
+                               value=f"{lo_:.2f} to {hi_:.2f} ({src}; lowest pair T{int(np.argmin(both))}-T{int(np.argmin(both)) + 1})",
+                               rule="Good if every adjacent pair accepts at least 15% of its swaps (20% to 50% is the usual target); check from 5%; problem below 5%: the ladder has a gap."))
+            ratio = hi_ / max(lo_, 1e-12)
+            checks.append(dict(key="swap_equal", label="Swap acceptance equalised across the ladder", status=_status(ratio, 1.5, 2.5),
+                               value=f"highest / lowest = {ratio:.2f}",
+                               rule="Good if the pairs differ by less than a factor 1.5; check up to 2.5. The adaptive ladder aims to equalise them; a large spread means it has not."))
+            if lo_ < 0.1:
+                obs.append(f"The swap acceptance of T{int(np.argmin(both))}-T{int(np.argmin(both)) + 1} is only {lo_:.2f}: replicas hardly cross that gap, so the hot chains help the cold chain very little.")
+                tips.append("Add temperatures, or lower the highest temperature, so that every pair accepts more swaps.")
+            elif lo_ >= 0.4:
+                obs.append(f"Every pair accepts {lo_:.2f} to {hi_:.2f} of its swaps: the temperatures are closer together than they need to be.")
+                tips.append("The same number of evaluations can reach a hotter top temperature (a larger Tmax at the same number of temperatures) while keeping the swap acceptance near 0.2 to 0.3. "
+                            "Whether a hotter top is needed is shown by the drift of the hottest chain below.")
+            if measured is not None and pred is not None and float(np.nanmax(np.abs(pred / np.maximum(measured, 1e-9) - 1))) > 0.4:
+                obs.append("The measured swap acceptance (whole run, including the burn-in) and the one predicted from the stored log likelihoods (after the burn-in) differ by more than 40% for some pair.")
+        if T == 1:
+            swap_html = "<p class=\"muted\">There is one temperature (no tempering), so there are no swaps.</p>"
+        elif both is not None:
+            swap_html = (_table(["pair", "T low", "T high", "measured (whole run)", "predicted (after burn-in)", "predicted / measured"], pairs_rows)
+                         + _img(_fig_ladder(E, pred, measured), "ladder and swaps", dpi))
+        else:
+            swap_html = "<p class=\"muted\">The backend has neither swap counters nor betas, so the swap acceptance cannot be shown.</p>"
+        # ---- ln L by temperature
+        meds = [float(np.nanmedian(LL[post_T][:, k])) for k in range(T)]
+        lnl_rows = [[f"T{k}", _eryn_fmt(1.0 / betas[-1, k], ".3f") if betas is not None else "n/a", _eryn_fmt(meds[k], ".2f"),
+                     _eryn_fmt(float(np.nanpercentile(LL[post_T][:, k], 16)), ".2f"), _eryn_fmt(float(np.nanpercentile(LL[post_T][:, k], 84)), ".2f")] for k in range(T)]
+        ordered = all(meds[k] > meds[k + 1] for k in range(T - 1))
+        if T > 1:
+            checks.append(dict(key="lnl_order", label="ln likelihood falls with temperature", status="ok" if ordered else "bad",
+                           value="medians " + " > ".join(f"{m:.1f}" for m in meds) if ordered else "medians " + ", ".join(f"{m:.1f}" for m in meds),
+                           rule="Good if the median ln likelihood of every temperature is below that of the colder one. Otherwise the temperatures are not ordered as the ladder says (a wrong temperature axis, or a run that has not equilibrated)."))
+        lnl_html = _table(["temperature", "T", "median ln L", "16%", "84%"], lnl_rows) + _img(_fig_lnl(E, start), "ln L by temperature", dpi)
+        # ---- acceptance of the moves
+        moves_html, acc0 = "", None
+        if E["moves"]:
+            mrows = []
+            for nm in sorted(E["moves"]):
+                a = E["moves"][nm]
+                mrows.append([nm] + [_eryn_fmt(float(np.nanmean(a[k])), ".3f") for k in range(T)] + [f"{_eryn_fmt(float(np.nanmin(a[0])), '.3f')} to {_eryn_fmt(float(np.nanmax(a[0])), '.3f')}"])
+            moves_html = _table(["move"] + [f"T{k}" for k in range(T)] + ["T0 walkers (min to max)"], mrows) + _img(_fig_moves(E), "move acceptance", dpi)
+            first = E["moves"][sorted(E["moves"])[0]]
+            acc0 = float(np.nanmean(first[0]))      # (the report's own acceptance check above judges it)
+            if acc0 < 0.1:
+                tips.append(f"The acceptance of the move is low at the cold temperature ({acc0:.3f}). A different or additional move (for example a differential-evolution move) is worth a trial, "
+                            "judged by the population autocorrelation time and the number of evaluations, not by the per-walker time.")
+        else:
+            moves_html = "<p class=\"muted\">The backend has no per-move acceptance (track_moves was off).</p>"
+        # ---- population autocorrelation and drift
+        steps_P = E["steps_P"]
+        rowsP = np.where(steps_P >= start)[0]
+        if len(rowsP) < 16:
+            rowsP = np.arange(len(steps_P) // 2, len(steps_P))
+        tau_p, z_p, shift_p = population_tau(E["chain_P"], rowsP, E["stride_P"])
+        names = run.col_names
+        slot = {r["name"]: r["tau"] for r in an["params"]}
+        post_steps = float(n - start)
+        pop_html, drift_html = "", ""
+        if np.isfinite(tau_p[0]).any():
+            order = np.argsort(-np.nan_to_num(tau_p[0], nan=-1))[:10]
+            prow = [[names[j], _eryn_fmt(slot.get(names[j]), ".1f"), _eryn_fmt(tau_p[0, j], ".0f"), _eryn_fmt(tau_p[0, j] / slot[names[j]], ".0f") if np.isfinite(slot.get(names[j], np.nan)) and slot[names[j]] > 0 else "n/a",
+                     _eryn_fmt(post_steps / tau_p[0, j], ".1f") if np.isfinite(tau_p[0, j]) else "n/a"] for j in order]
+            pop_html = (f"<p class=\"muted\">Autocorrelation time of the ensemble mean of each parameter in the cold chain, on the steps after {start_note} (step {start:,}). "
+                        "Compared with the per-walker time of the Convergence section, which a swap refreshes within a few steps.</p>"
+                        + _table(["parameter", "per-walker tau (steps)", "population tau (steps)", "ratio", "steps / population tau"], prow))
+            jmax = int(np.nanargmax(tau_p[0]))
+            checks.append(dict(key="pop_tau", label="Run length vs the population autocorrelation time", status=_status(post_steps / tau_p[0, jmax], 50, 20, True),
+                               value=f"{post_steps / tau_p[0, jmax]:.1f} (population tau {tau_p[0, jmax]:.0f} steps, {names[jmax]})",
+                               rule="Good if the steps after the burn-in are at least 50 population autocorrelation times; check from 20; problem below 20. This is the time that governs slow collective behaviour such as mode weights."))
+            slot_max = np.nanmax([v for v in slot.values() if np.isfinite(v)]) if slot else np.nan
+            if np.isfinite(slot_max) and tau_p[0, jmax] > 5 * max(slot_max, 1):
+                obs.append(f"The per-walker autocorrelation time is at most {slot_max:.0f} steps, but the ensemble mean of {names[jmax]} has {tau_p[0, jmax]:.0f}: swaps refresh the walker slots quickly "
+                           "while the population as a whole moves slowly, so the per-walker time says the run is much better converged than it is for mode weights and other collective quantities.")
+                tips.append("Judge the length of the run by the population autocorrelation time; shares of walkers in each mode, followed by temperature, show whether they have stopped changing.")
+            # drift by temperature: the shift of the ensemble mean between the two halves, in posterior standard deviations (and z, which needs the autocorrelation time)
+            drows = []
+            worst = (0.0, 0, 0)
+            for t in range(T):
+                sh = np.abs(shift_p[t])
+                if np.isfinite(sh).any():
+                    jj = int(np.nanargmax(sh))
+                    drows.append([f"T{t}", _eryn_fmt(final_T[t], ".2f") if final_T is not None else "n/a", (_eryn_fmt(sh[jj], ".2f"), _st_cls(_status(float(sh[jj]), 0.1, 0.25))), names[jj],
+                                  _eryn_fmt(abs(z_p[t, jj]), ".1f"), _eryn_fmt(np.nanmax(tau_p[t]), ".0f")])
+                    if sh[jj] >= worst[0]:
+                        worst = (float(sh[jj]), t, jj)
+            drift_html = ("<p class=\"muted\">For every temperature: how far the ensemble mean of each parameter moved between the first and second half of the run after the burn-in, in units of that parameter's spread over "
+                          "all walkers and steps. The largest over the parameters is shown, with the half-vs-half z in standard errors for comparison: z uses the population autocorrelation time, which is long "
+                          "precisely when the mean is drifting, so a small z does not clear a large shift. A hot chain that is still drifting has not equilibrated, and the cold chain inherits that through the swaps.</p>"
+                          + _table(["temperature", "T", "largest shift (posterior sd)", "parameter", "z", "largest population tau (steps)"], drows))
+            checks.append(dict(key="drift_T", label="Shift of the ensemble mean at every temperature", status=_status(worst[0], 0.1, 0.25),
+                               value=f"largest shift between the halves = {worst[0]:.2f} posterior sd (T{worst[1]}, {names[worst[2]]})",
+                               rule="Good if no parameter's ensemble mean, at any temperature, moves by more than 0.1 of its spread between the first and second half after the burn-in; check up to 0.25; problem above."))
+            if worst[0] >= 0.25 and worst[1] == T - 1:
+                obs.append(f"The ensemble mean of {names[worst[2]]} at the hottest temperature moved by {worst[0]:.2f} posterior sd between the halves of the run: the hot end has not equilibrated, and the colder chains follow it through the swaps.")
+                tips.append("A hotter top temperature (or more temperatures), or walkers started from a posterior that already contains every mode, shortens the equilibration of the whole ladder.")
+            elif worst[0] >= 0.25:
+                obs.append(f"The ensemble mean of {names[worst[2]]} at T{worst[1]} moved by {worst[0]:.2f} posterior sd between the halves of the run after the burn-in: it is still drifting.")
+            pj = [int(j) for j in np.argsort(-np.nan_to_num(tau_p[0], nan=-1))[:6]]
+            pop_fig = _img(_fig_population(E, pj, [names[j] for j in pj], start), "population means by temperature", dpi)
+        else:
+            pop_fig = ""
+            pop_html = "<p class=\"muted\">Too few rows after the burn-in to estimate a population autocorrelation time.</p>"
+        sections_html = (
+            "<p class=\"muted\">A tempered ensemble runs the same walkers at several temperatures T = 1 / beta and swaps them between neighbours; the posterior is the temperature-1 chain (the cold chain analysed in the rest of this report). "
+            f"The statistics below use {start_note}.</p>"
+            + (f"<p class=\"muted\">{_html.escape(' '.join(E['notes']))}</p>" if E["notes"] else "")
+            + "<h3>Temperature ladder</h3>" + (ladder_html or "<p class=\"muted\">no betas</p>")
+            + "<h3>Swaps</h3><p class=\"muted\">Measured: swaps accepted over steps x walkers, from the backend counters (whole run, burn-in included). Predicted: from the stored ln likelihoods, "
+              "pairing walkers of neighbouring temperatures at random after the burn-in; it needs no counter and shows what the ladder does now. Green band: 0.2 to 0.5.</p>" + swap_html
+            + "<h3>ln likelihood by temperature</h3><p class=\"muted\">Temperatures must be ordered, and neighbours must overlap for swaps to be accepted.</p>" + lnl_html
+            + "<h3>Move acceptance</h3>" + moves_html
+            + "<h3>Population autocorrelation</h3>" + pop_html
+            + ("<h3>Drift of every temperature</h3>" + drift_html + "<h3>Ensemble means by temperature</h3><p class=\"muted\">The six parameters with the longest population autocorrelation time. "
+               "Every temperature should fluctuate around a flat level after the burn-in (purple dashed line).</p>" + pop_fig if drift_html else ""))
+        cards = [("temperatures", f"{T}"), ("highest temperature", _eryn_fmt(final_T[-1], ".2f") if final_T is not None else "n/a"),
+                 ("swap acceptance", f"{np.min(both):.2f} to {np.max(both):.2f}" if both is not None else "n/a", "lowest to highest pair"),
+                 ("lnL evaluations, all temperatures", f"{n * W * T:,}", "steps x walkers x temperatures")]
+        methods = ("<details><summary>Tempering diagnostics</summary><ul>"
+                   "<li><b>Cold chain.</b> The report above is for temperature index 0 (beta = 1), the walkers being the walkers of that temperature. Its ln p is the ln likelihood plus the ln prior.</li>"
+                   "<li><b>Ladder.</b> betas at every saved step (at a stride for long runs). Settled means that none changes by more than 2% over the last quarter of the run.</li>"
+                   "<li><b>Swap acceptance.</b> Measured is the backend counter divided by steps x walkers (one swap attempt per walker pair per step); predicted uses min(1, exp((beta_k - beta_k+1)(lnL_k+1 - lnL_k))) with random pairing.</li>"
+                   "<li><b>Population autocorrelation.</b> The ensemble mean of each parameter at each temperature is a time series with one value per step; its integrated autocorrelation time uses the same estimator as the rest of the report. "
+                   "Drift is the shift of that mean between the two halves in units of the parameter's spread (the z in standard errors is also shown; it can be misleadingly small when the mean has a trend).</li>"
+                   "<li><b>Limits.</b> The thresholds are rules of thumb. Replica round trips cannot be counted because the backend does not record which replica is where. "
+                   "All statistics after the burn-in use the estimated burn-in of the cold chain (or half of the run when none was found).</li></ul></details>")
+        header = f"; Eryn {E['version']}, {T} temperatures, cold chain shown" + (f", stride {E['stride']}" if E["stride"] > 1 else "")
+        return dict(sections=[("tempering", "Tempering", sections_html)], checks=checks, diagnosis=obs, suggestions=tips, cards=cards, methods=methods, header=header)
+    return extras
+
+
+def eryn_report(args, kwargs=None, sampler_kwargs=None, out_path=None, safe=True, burn=0, max_steps=20000, title=None, spin_model=None, physical="args", branch=None, fixed=None,
+                dpi=110, **build_kw):
+    """The Eryn report: the emcee report (PART 1) on the cold chain, plus the Tempering section, checks and verdict."""
+    def _go():
+        path = getattr(args, "output_h5", None) or backend_path(args)
+        sky, tm = bool(getattr(args, "vary_skypos", False)), bool(getattr(args, "vary_time", False))
+        info = eryn_file_info(path, branch)
+        ok = [m for m in ("precessing", "aligned", "none") if len(get_layout(m, sky, tm)) == info["ndim"]]
+        if spin_model is None:
+            if len(ok) != 1:
+                raise ValueError(f"{path} has {info['ndim']} sampled columns, which does not match --vary-skypos={sky} --vary-time={tm}. "
+                                 f"Run configurations with {info['ndim']} columns: {candidate_layouts(info['ndim'])}")
+            sm = ok[0]
+        else:
+            sm = spin_model
+        names = get_layout(sm, sky, tm)
+        E = read_eryn_backend(path, names=names, max_steps=max_steps, branch=branch)
+        phys = _physical_from_args(args, kwargs, sm, sky, tm, fixed) if (isinstance(physical, str) and physical == "args") else physical
+        out = out_path or default_out_path(args)
+        an = build_report(E["run"], out, title=title or f"eryn diagnostics: {os.path.basename(path)}", burn=burn, physical=phys, arguments=args, reference_values=kwargs,
+                             extras=make_eryn_extras(E, dpi), kind="eryn", dpi=dpi, **build_kw)
+        _print_summary(an)
+        return an
+
+    if not safe:
+        return _go()
+    try:
+        return _go()
+    except Exception as error:                                   # a diagnostics problem must not break the run
+        print(f"WARNING: the eryn diagnostics report could not be made: {type(error).__name__}: {error}")
+        return None
+
+
+# ============================================================================================================================================
+# command line
+# ============================================================================================================================================
+def _eryn_cli(argv):
+    ap = argparse.ArgumentParser(prog="sampler_diagnostics.py eryn", description="HTML diagnostics of a finished Eryn run from its backend (.h5): the cold chain through the emcee report, "
+                                 "and the Tempering section.", epilog=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("path", help="the Eryn backend .h5")
+    ap.add_argument("-o", "--out", default=None, help="report to write (default: <path without .h5>_diagnostics.html)")
+    ap.add_argument("--vary-skypos", action="store_true", help="the run sampled the sky position (tells the layout of the columns)")
+    ap.add_argument("--vary-time", action="store_true", help="the run sampled the geocenter time")
+    ap.add_argument("--max-steps", type=int, default=20000, help="read the cold chain with a stride when there are more steps than this (default 20000)")
+    ap.add_argument("--burn", default="0", help="what to discard before the statistics: a number of steps, a fraction of the run (below 1), or auto (the estimated burn-in). "
+                                                "Default: nothing; the estimated burn-in is shown")
+    a = ap.parse_args(argv)
+    ns = argparse.Namespace(output=a.path, output_h5=a.path, vary_skypos=a.vary_skypos, vary_time=a.vary_time, reference_parameters=None)
+    out = a.out or (re.sub(r"\.h5$", "", a.path) + "_diagnostics.html")
+    run("eryn", ns, out_path=out, safe=False, max_steps=a.max_steps, burn=_parse_burn(a.burn))
+
+
+def main(argv=None):
+    """python sampler_diagnostics.py {emcee|eryn|bilby_mcmc} ...; without a sampler name the old emcee command line is understood."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "emcee":
+        return emcee_main(argv[1:])
+    if argv and argv[0] == "bilby_mcmc":
+        return bilby_main(argv[1:])
+    if argv and argv[0] == "eryn":
+        return _eryn_cli(argv[1:])
+    if argv and argv[0] in ("-h", "--help") or not argv:
+        print(__doc__)
+        return None
+    return emcee_main(argv)
 
 
 if __name__ == "__main__":
