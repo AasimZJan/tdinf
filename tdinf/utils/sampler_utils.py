@@ -2,16 +2,15 @@ import numpy as np
 
 try:
     import emcee
-except ImportError:                      # the emcee helpers at the end need it; the bilby part does not
+except ImportError:                     
     emcee = None
 
 try:
     from bilby.core.prior import PriorDict
     from bilby.bilby_mcmc import proposals as _proposals
     from bilby.bilby_mcmc.proposals import (AdaptiveGaussianProposal, DifferentialEvolutionProposal, FisherMatrixProposal, GMMProposal, KDEProposal, PriorProposal, ProposalCycle)
-    _BILBY_ERROR = None
-except ImportError as _error:            # an emcee-only environment can still import this file; the GW cycle then says what is missing
-    PriorDict, _proposals, _BILBY_ERROR = object, None, _error
+except ImportError:           
+    bilby = None
 
 
 ###########################################################################################
@@ -276,7 +275,6 @@ def emcee_moves(spec):
     """
     if spec is None or spec == 'stretch':
         return None
-    _require_emcee("the 'de' or list-of-moves setting")
     if spec == 'de':
         return [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
     if isinstance(spec, (list, tuple)):
@@ -306,6 +304,55 @@ def emcee_burn_in_and_thin(sampler):
 # eryn functions
 ###########################################################################################
 
+def eryn_steps_in_backend_file(path):
+    """
+    Number of steps written to an Eryn HDF5 backend, read with h5py and independently of Eryn: the `iteration` attribute of the group that holds the chain or, when that cannot
+    be read, the last row of the chain that is not all zeros (Eryn grows its datasets ahead of the run). 0 only when the file opens and certainly holds no steps; None when it
+    cannot be told (the file does not open, for example because it is locked, truncated or being written).
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+    try:
+        with h5py.File(path, 'r') as f:
+            chains = []
+
+            def visit(name, obj):
+                if isinstance(obj, h5py.Dataset) and 'chain' in name.split('/') and len(obj.shape) == 5:
+                    chains.append(name)
+
+            f.visititems(visit)
+            if not chains:
+                # made, but nothing was ever written, unless a counter says that steps were taken: then the chain is missing from a damaged file, and the file is not empty
+                taken = [int(f.attrs['iteration'])] if 'iteration' in f.attrs else []
+
+                def look(name, obj):
+                    if 'iteration' in obj.attrs:
+                        taken.append(int(obj.attrs['iteration']))
+
+                f.visititems(look)
+                return None if any(t > 0 for t in taken) else 0
+            chain = f[sorted(chains)[0]]
+            group = sorted(chains)[0].split('/chain/')[0] if '/chain/' in sorted(chains)[0] else ''
+            try:
+                return int((f[group] if group else f).attrs['iteration'])
+            except Exception:
+                pass
+            total = chain.shape[0]
+            filled = lambda i: bool(np.any(np.asarray(chain[i]) != 0))
+            if total == 0 or not filled(0):
+                return 0
+            if filled(total - 1):
+                return int(total)
+            lo, hi = 0, total - 1
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                lo, hi = (mid, hi) if filled(mid) else (lo, mid)
+            return int(lo + 1)
+    except Exception:
+        return None
+
 def eryn_moves(spec):
     """The `moves` of Eryn's EnsembleSampler from the "moves" setting: None or "stretch" is Eryn's default; "de" is differential evolution (if this Eryn has DEMove)."""
     if spec is None or spec == 'stretch':
@@ -317,16 +364,96 @@ def eryn_moves(spec):
         return [(eryn.moves.DEMove(), 1.0)]
     raise ValueError(f"the Eryn setting 'moves' must be null, 'stretch' or 'de', not {spec!r}")
 
+def _robust_sd(a):
+    """Standard deviation from the median absolute deviation (insensitive to a few frozen walkers)."""
+    a = np.asarray(a, dtype=float)
+    return 1.4826 * float(np.nanmedian(np.abs(a - np.nanmedian(a))))
 
-def eryn_burn_in_and_thin(cold_chain):
-    """The burn-in and thinning of run_emcee (5 x the largest and 0.5 x the smallest autocorrelation time), here of the COLD chain, shape (steps, walkers, ndim)."""
+
+def eryn_plateau_burn_in(ln_posterior, nblocks=60, tail_frac=0.25):
+    """
+    Burn-in, in steps, from the ensemble-median ln posterior of the cold chain (ln_posterior: steps x walkers); the estimator of the sampler diagnostics report.
+    The median over walkers at every step is cut into blocks; the plateau is its median over the last `tail_frac` of the run, the tolerance is the larger of 0.1 x the robust
+    scatter of late ln p and 3 x the scatter of the late ensemble median; the burn-in ends where every later block stays above plateau minus tolerance. Returns
+    (steps, found). If the median is still changing in the last blocks no plateau is found and half of the run is returned with found False.
+    """
+    lnp = np.asarray(ln_posterior, dtype=float)
+    n = lnp.shape[0]
+    med = np.nanmedian(lnp, axis=1)
+    nb = int(min(nblocks, max(4, n // 10)))
+    edges = np.linspace(0, n, nb + 1).astype(int)
+    block = np.array([np.nanmedian(med[x:y]) for x, y in zip(edges[:-1], edges[1:])])
+    t0 = int(n * (1 - tail_frac))
+    ref = np.nanmedian(med[t0:])
+    tol = max(0.1 * _robust_sd(lnp[t0:]), 3.0 * float(np.nanstd(med[t0:])), 1e-12)
+    bad = block < ref - tol
+    if not bad.any():
+        return 0, True
+    last_bad = int(np.max(np.nonzero(bad)[0]))
+    if last_bad >= nb - 2:
+        return n // 2, False
+    return int(edges[last_bad + 1]), True
+
+def eryn_burn_in_and_thin(cold_chain, ln_posterior=None, burn_in_percent=None):
+    """
+    The burn-in and thinning, in steps, of the COLD chain of an Eryn run: cold_chain has shape (steps, walkers, ndim) and ln_posterior (steps, walkers) is its ln likelihood plus ln prior.
+
+    burn-in: burn_in_percent per cent of the steps when it is given. Otherwise the LARGER of
+      * 5 x the largest autocorrelation time of the whole chain (the rule of run_emcee), and
+      * the start of the ln posterior plateau (eryn_plateau_burn_in; needs ln_posterior).
+    The autocorrelation time of a walker SLOT of a tempered ensemble is only a few steps, because swaps refresh the slot, so the first rule alone gives a burn-in far shorter than the
+    equilibration of ln p; the plateau is what sets it in practice. A burn-in beyond half of the run is cut to half of it, with a warning.
+    thin: 0.5 x the LARGEST autocorrelation time of the steps after the burn-in (it was the smallest, over the whole chain).
+    """
+    n = cold_chain.shape[0]
+
+    def tau_of(chain):
+        return np.asarray(emcee.autocorr.integrated_time(chain, c=5, tol=0, quiet=True), dtype=float)
+
+    if burn_in_percent is not None:
+        burnin = int(round(float(burn_in_percent) / 100.0 * n))
+        why = f"{float(burn_in_percent):g}% of the {n} steps (burn_in_percent)"
+    else:
+        try:
+            tau_burn = max(int(5 * np.max(tau_of(cold_chain))), 0)
+        except Exception as error:
+            tau_burn = 0
+            print(f"WARNING: no autocorrelation time for the burn-in ({type(error).__name__}); the ln p plateau alone sets it")
+        plateau, found = (eryn_plateau_burn_in(ln_posterior) if ln_posterior is not None else (0, None))
+        burnin = max(tau_burn, plateau)
+        why = (f"the larger of 5 x the largest autocorrelation time ({tau_burn}) and the ln p plateau "
+               + ("(not given)" if found is None else f"({plateau}{'' if found else ', none found: half of the run'})"))
+        if burnin > n // 2:
+            print(f"WARNING: the burn-in rule asks for {burnin} of {n} steps, more than half of the run: using half. The run is short for its autocorrelation time or ln p has not settled.")
+            burnin = n // 2
+    burnin = int(min(max(burnin, 0), max(n - 2, 0)))
     try:
-        tau = emcee.autocorr.integrated_time(cold_chain, c=5, tol=0, quiet=True)
-        burnin = max(int(5 * np.max(tau)), 0)
-        thin = max(int(0.5 * np.min(tau)), 1)
-        print(f'burnin = {burnin}, thin = {thin}')
-    except Exception:
-        print('WARNING thinning by 1, 0 burnin!')
-        burnin = 0
+        post = cold_chain[burnin:] if n - burnin >= 50 else cold_chain
+        thin = max(int(0.5 * np.max(tau_of(post))), 1)
+    except Exception as error:
         thin = 1
+        print(f"WARNING: no autocorrelation time for the thinning ({type(error).__name__}): thinning by 1")
+    print(f'burnin = {burnin}, thin = {thin}')
+    print(f"eryn burn-in {burnin} steps: {why}; thin {thin}: 0.5 x the largest autocorrelation time after the burn-in")
     return burnin, thin
+
+
+def eryn_sample_steps(n_steps, nwalkers, burnin, thin, max_samples=None):
+    """
+    The steps to keep: those after the burn-in at a regular stride, counted back from the last step (which is always kept), every walker at each kept step.
+    The stride is `thin`, or larger when max_samples (a cap on steps x walkers after the burn-in; None for no cap) asks for it. A regular stride in steps measured better than
+    random rows, a subset of walkers or random steps: it covers the run evenly, which matters while the ensemble is still drifting slowly. At least one step (all walkers) is kept.
+    """
+    available = int(n_steps) - int(burnin)
+    if available < 1:
+        raise ValueError(f"a burn-in of {burnin} leaves nothing of {n_steps} steps")
+    stride = max(int(thin), 1)
+    if max_samples is not None:
+        cap = max(int(max_samples) // int(nwalkers), 1)                      # the most steps that fit
+        cap_stride = max(int(np.ceil(available / float(cap))), 1)
+        while (available - 1) // cap_stride + 1 > cap:                       # the first possible step is kept as well as the last
+            cap_stride += 1
+        stride = max(stride, cap_stride)
+    last = int(n_steps) - 1
+    first = last - stride * ((last - int(burnin)) // stride)
+    return np.arange(first, int(n_steps), stride)
