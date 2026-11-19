@@ -3,6 +3,7 @@ from scipy.stats import gaussian_kde
 from gwpy.timeseries import TimeSeries
 from gwpy.signal import filter_design
 import scipy.linalg as sl
+from scipy import fft as sp_fft
 from scipy.interpolate import interp1d
 from scipy.spatial.distance import jensenshannon
 from scipy.stats import gaussian_kde
@@ -217,6 +218,74 @@ def gohberg_semencul_multiply(Tinv_first_col, b):
 
     # 4. Combine
     return (1.0 / x0) * (term_1 - term_2)
+
+
+class ToeplitzInnerProduct:
+    """
+    Fast noise-weighted inner products <a, b> = a^T C^{-1} b for a symmetric Toeplitz noise covariance C
+    (first row = ACF `rho`).
+
+    Gohberg-Semencul: C^{-1} = (L1 L1^T - L2 L2^T) / x0, with x = C^{-1} e0, L1 = lower Toeplitz(x) and
+    L2 = lower Toeplitz([0, x_{N-1}, ..., x_1]). A quadratic form therefore needs only TWO triangular
+    Toeplitz products (instead of the four in gohberg_semencul_multiply, which builds the full vector C^{-1} r):
+
+        <r, r> = |L1^T r / sqrt(x0)|^2 - |L2^T r / sqrt(x0)|^2      -> 1 rfft + 1 batched irfft + 2 dots
+
+    Both products are correlations with FIXED kernels, so their FFTs are computed once here (at a fast FFT
+    length) instead of inside every scipy.linalg.matmul_toeplitz call.
+    The object holds only numpy arrays, so it pickles cheaply to multiprocessing workers.
+    """
+
+    def __init__(self, rho, Tinv_first_col=None):
+        rho = np.asarray(rho, dtype=float)
+        self.rho = rho
+        self.N = N = len(rho)
+        if Tinv_first_col is None:
+            Tinv_first_col = gohberg_semencul_prep(rho)
+        x = np.asarray(Tinv_first_col, dtype=float)
+        self.x0 = x[0]
+
+        # FFT length that avoids wrap-around for lags 0..N-1 of a length-N correlation
+        self.nfft = M = sp_fft.next_fast_len(2 * N - 1, real=True)
+        kernels = np.zeros((2, M))
+        kernels[0, :N] = x                  # first column of L1
+        kernels[1, 1:N] = x[1:][::-1]       # first column of L2
+        # (L^T h)_i = sum_j k_{j-i} h_j  <->  irfft(rfft(h) * conj(rfft(k))); 1/sqrt(x0) folded in
+        self._K = np.conj(sp_fft.rfft(kernels, axis=-1)) / np.sqrt(self.x0)
+
+    def _triangular_products(self, h):
+        """[L1^T h, L2^T h] / sqrt(x0), shape (2, N)."""
+        H = sp_fft.rfft(h, n=self.nfft)
+        return sp_fft.irfft(H * self._K, n=self.nfft, axis=-1)[:, :self.N]
+
+    def norm2(self, h):
+        """<h, h> = h^T C^{-1} h."""
+        a, b = self._triangular_products(h)
+        return a @ a - b @ b
+
+    def inner(self, x, y):
+        """<x, y> = x^T C^{-1} y (one batched pass for both vectors)."""
+        T = self._triangular_products_batched(np.stack((x, y)))     # (2 vectors, 2 kernels, N)
+        return T[0, 0] @ T[1, 0] - T[0, 1] @ T[1, 1]
+
+    def _triangular_products_batched(self, hs):
+        H = sp_fft.rfft(hs, n=self.nfft, axis=-1)
+        return sp_fft.irfft(H[:, None, :] * self._K[None], n=self.nfft, axis=-1)[..., :self.N]
+
+    def apply_inverse(self, b):
+        """C^{-1} b via Gohberg-Semencul with precomputed kernel FFTs (drop-in for gohberg_semencul_multiply)."""
+        T = self._triangular_products(b)
+        V = sp_fft.rfft(T, n=self.nfft, axis=-1) * np.conj(self._K)   # L @ v is a convolution with the kernel
+        out = sp_fft.irfft(V, n=self.nfft, axis=-1)[:, :self.N]
+        return out[0] - out[1]
+
+    def snrs(self, h, d):
+        """(optimal SNR, matched-filter SNR) of template h against data d, from one batched pass."""
+        T = self._triangular_products_batched(np.stack((h, d)))
+        hh = T[0, 0] @ T[0, 0] - T[0, 1] @ T[0, 1]
+        hd = T[0, 0] @ T[1, 0] - T[0, 1] @ T[1, 1]
+        opt = np.sqrt(hh)
+        return opt, hd / opt
 
 
 def calc_mf_SNR(d, s, rho):
