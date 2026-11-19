@@ -459,6 +459,55 @@ class LnPriorManager(LogisticParameterManager):
         
         p0 = p0_arr.tolist()
         return p0
+    
+    def sample_prior(self, nwalkers, use_lvk_mass_and_time_prior=False):
+        '''
+        `nwalkers` independent draws from the prior that get_lnprior defines, in the sampling coordinates (a list of rows, in the order of sampled_keys).
+
+        The prior of the sampling coordinates is
+          * Logistic(0, 1) for every logistic coordinate (total mass, mass ratio, distance, cos inclination, spin magnitudes, sin declination, eccentricity):
+            the logistic transform of a variable that is uniform in the physical parameter, which is what get_lnprior's Jacobian terms make of it;
+          * Gaussian(0, 1) for both components of every Cartesian angle and for the spin-direction numbers c;
+          * Gaussian(reference time, sigma_time) for geocenter_time, or Uniform(reference time +- 0.075 s) with use_lvk_mass_and_time_prior;
+          * with use_lvk_mass_and_time_prior also flat in the detector-frame masses: the mass coordinates are drawn flat in (total mass, mass ratio) and a draw is kept
+            with probability proportional to total_mass / (1 + mass_ratio)**2, the factor get_lnprior adds.
+
+        initialize_walkers, without a reference, starts the logistic coordinates from N(0, 1), which is about half as wide as their prior (standard deviation 1 against 1.81):
+        the walkers of that start are not distributed as the prior. These are.
+        '''
+        keys = list(self.sampled_keys)
+        logistic = {p.logistic_name: p for p in self.logistic_parameters}
+        gaussian = [name for p in self.cartesian_angles for name in (p.x_name, p.y_name)] + [k for k in keys if k[:3] in ('c1_', 'c2_')]
+        unknown = [k for k in keys if k not in logistic and k not in gaussian and k != 'geocenter_time']
+        if unknown:
+            raise NotImplementedError(f"sample_prior does not know the prior of the sampled coordinates {unknown}: add them here, next to get_lnprior")
+
+        p0 = np.zeros((nwalkers, len(keys)))
+        for k, name in enumerate(keys):
+            if name in logistic:
+                p0[:, k] = np.random.logistic(size=nwalkers)
+            elif name in gaussian:
+                p0[:, k] = np.random.normal(size=nwalkers)
+
+        if use_lvk_mass_and_time_prior and 'x_total_mass' in logistic and 'x_mass_ratio' in logistic:
+            mass, ratio = logistic['x_total_mass'], logistic['x_mass_ratio']
+            (m_lo, m_hi), (q_lo, q_lo_hi) = mass.limit, ratio.limit
+            weight_max = m_hi / (1.0 + q_lo) ** 2          # total_mass / (1 + mass_ratio)**2 grows with the mass and falls with the ratio
+            m_kept, q_kept = np.empty(0), np.empty(0)
+            while len(m_kept) < nwalkers:
+                n = max(2 * (nwalkers - len(m_kept)), 16)
+                m, q = np.random.uniform(m_lo, m_hi, n), np.random.uniform(q_lo, q_lo_hi, n)
+                keep = np.random.uniform(size=n) < (m / (1.0 + q) ** 2) / weight_max
+                m_kept, q_kept = np.concatenate([m_kept, m[keep]]), np.concatenate([q_kept, q[keep]])
+            p0[:, keys.index('x_total_mass')] = mass.physical_to_logistic(m_kept[:nwalkers])
+            p0[:, keys.index('x_mass_ratio')] = ratio.physical_to_logistic(q_kept[:nwalkers])
+
+        if self.vary_time:
+            if use_lvk_mass_and_time_prior:
+                p0[:, keys.index('geocenter_time')] = np.random.uniform(self.reference_time - 0.075, self.reference_time + 0.075, size=nwalkers)
+            else:
+                p0[:, keys.index('geocenter_time')] = np.random.normal(loc=self.reference_time, scale=self.sigma_time, size=nwalkers)
+        return p0.tolist()
 
     def get_lnprior(self, x, phys_dict=None, use_lvk_mass_and_time_prior=False):
         '''
@@ -938,6 +987,12 @@ class LnLikelihoodManager(LogisticParameterManager):
         self.Tinv_first_col_dict = {}
         for ifo in self.ifos:
             self.Tinv_first_col_dict[ifo] = gohberg_semencul_prep(self.rho_dict[ifo])
+
+        # Fast inner products: Gohberg-Semencul kernel FFTs precomputed once per ifo (see misc.ToeplitzInnerProduct)
+        self.inner_product_dict = {
+            ifo: ToeplitzInnerProduct(self.rho_dict[ifo], Tinv_first_col=self.Tinv_first_col_dict[ifo])
+            for ifo in self.ifos
+        }
         super().__init__(*args, **kwargs)
 
     def _make_autocorrolation_dict(self):
@@ -969,14 +1024,10 @@ class LnLikelihoodManager(LogisticParameterManager):
             # This is actually fine when calculating the likelihood, but 
             # we want to print out that it is happening to the log file
             return False
-        # Check for NaNs in the residual
-        if sum(np.isnan(residual)) > 0:
-            print('NaNs in residuals for:')
-            print(phys_dict)
-            return True
-        # Check for infinities in the residual
-        if sum(np.isinf(residual)) > 0:
-            print('infinities in residuals for:')
+        # Check for NaNs / infinities (one vectorised pass; Python's builtin sum over a numpy array is very slow)
+        if not np.isfinite(residual).all():
+            kind = 'NaNs' if np.isnan(residual).any() else 'infinities'
+            print(f'{kind} in residuals for:')
             print(phys_dict)
             return True
         return False
@@ -1032,20 +1083,16 @@ class LnLikelihoodManager(LogisticParameterManager):
         # Cycle through ifos
         for ifo, data in self.data_dict.items():
 
-            # Truncate and compute residuals
+            # Compute residuals
             r = data - projected_wf_dict[ifo]
 
             # Check for other waveform errors
             if self.waveform_has_error(x_phys, projected_wf_dict[ifo], r):
                 return -np.inf
 
-            # "Over whiten" residuals
-            # rwt = solve_toeplitz(self.rho_dict[ifo], r)
-            rwt = gohberg_semencul_multiply(self.Tinv_first_col_dict[ifo], r)
+            # -0.5 r^T C^{-1} r (same as -0.5 * r @ gohberg_semencul_multiply(Tinv_first_col, r), but faster)
+            ln_posterior -= 0.5 * self.inner_product_dict[ifo].norm2(r)
 
-            # Compute log likelihood for ifo
-            ln_posterior -= 0.5 * np.dot(r, rwt)
-            
         return ln_posterior
 
     def get_log_posterior(self, x, verbose=False, **kwargs):
@@ -1134,13 +1181,11 @@ class LnLikelihoodManager(LogisticParameterManager):
             
             # cycle through the interferometers
             for ifo in self.ifos:
-            
-                sig = projected_wf_dict[ifo]
-                data = self.data_dict[ifo]
-                rho = self.rho_dict[ifo]
-                
-                opt_snrs.append(calc_opt_SNR(sig, rho))
-                mf_snrs.append(calc_mf_SNR(data, sig, rho))
+
+                # same as calc_opt_SNR / calc_mf_SNR, with the precomputed inner products
+                opt_snr, mf_snr = self.inner_product_dict[ifo].snrs(projected_wf_dict[ifo], self.data_dict[ifo])
+                opt_snrs.append(opt_snr)
+                mf_snrs.append(mf_snr)
                 
             # add to arrays 
             per_detector_opt_snrs[:,i] = opt_snrs
