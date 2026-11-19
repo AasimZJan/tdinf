@@ -158,6 +158,8 @@ def create_run_sampler_arg_parser():
     p.add_argument('--verbose', action='store_true',
                    help='Include flag if you want code to print out additional information as it '
                         'runs. Helpful for debugging.')
+    p.add_argument('--produce-diagnostics', action='store_true',
+                   help='Write an HTML sampler-diagnostics report next to the output, after the sampler has finished and before the .dat is made.')
 
     # Options of the emcee-only version of this script. They are NOT used any more (sampler settings go in --sampler-kwargs), but
     # group_postprocess.py and waveform_h5s.py read the command_line.sh of earlier runs with THIS parser, and those lines contain
@@ -165,7 +167,7 @@ def create_run_sampler_arg_parser():
     p.add_argument('--nwalkers', type=int, default=512, help=argparse.SUPPRESS)
     p.add_argument('--nsteps', type=int, default=50000, help=argparse.SUPPRESS)
     p.add_argument('--ncpu', type=int, default=4, help=argparse.SUPPRESS)
-    p.add_argument('--produce-diagnostics', action='store_true', help=argparse.SUPPRESS)
+    
 
     return p
 
@@ -364,10 +366,14 @@ def get_injected_parameters(args, initial_run_dir='', verbose=False):
     return reference_parameters, ref_pe_samples
 
 def get_initial_walkers(likelihood_manager, args, nwalkers, ndim,
-                        reference_parameters, ref_pe_samples, verbose=True): 
+                        reference_parameters, ref_pe_samples, verbose=True, from_prior=False): 
     '''
     Function to get the correct posterior distribution (or None) for walker initialization
     '''
+    if from_prior:
+        print('initial walkers are from the prior')
+        return likelihood_manager.log_prior.sample_prior(nwalkers, use_lvk_mass_and_time_prior=args.use_lvk_mass_and_time_prior)
+    
     print('initial walkers folder:', args.initial_walkers)
 
     # Case 1: no initial_walkers_distribution passed via args, then default to the reference PE samples
@@ -655,7 +661,7 @@ def run_bilby_mcmc(likelihood_manager, args, kwargs, sampler_kwargs, reference_p
         pt_rejection_sample=False,       # (False) rejection-sample the tempered chains when drawing samples
         # steps and convergence
         L1steps=100,                     # (100) internal steps per iteration; the ACT is counted in iterations
-        L2steps=1,                       # (3) iterations between swaps of the tempered and ensemble chains
+        L2steps=3,                       # (3) iterations between swaps of the tempered and ensemble chains
         autocorr_c=5,                    # (5) minimum number of ACTs needed to trust the ACT estimate
         min_tau=1,                       # (1) smallest ACT accepted; can be used to force a larger one
         fixed_tau=None,                  # (None) a fixed ACT instead of an estimated one (see docstring)
@@ -832,6 +838,7 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
             'progress':True,
             'moves':None,
             'produce_diagnostics':bool(args.produce_diagnostics),
+            'initialize_from_prior':False,     # (False) True: draw the walkers from the prior (log_prior.sample_prior) instead of starting them at the reference point or posterior
             }        
 
     SAMPLER.update(sampler_kwargs)
@@ -870,11 +877,11 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
                 os.remove(backend_path)
                 backend = emcee.backends.HDFBackend(backend_path)
                 backend.reset(nwalkers, ndim)
-            p0 = get_initial_walkers(likelihood_manager, args, nwalkers, ndim, reference_parameters, ref_pe_samples)
+            p0 = get_initial_walkers(likelihood_manager, args, nwalkers, ndim, reference_parameters, ref_pe_samples, from_prior=bool(SAMPLER['initialize_from_prior']))
     else:
         # Reset the backend or make new backend
         backend.reset(nwalkers, ndim)
-        p0 = get_initial_walkers(likelihood_manager, args, nwalkers, ndim, reference_parameters, ref_pe_samples)
+        p0 = get_initial_walkers(likelihood_manager, args, nwalkers, ndim, reference_parameters, ref_pe_samples, from_prior=bool(SAMPLER['initialize_from_prior']))
 
     # Avoid oversubscribing cores with BLAS/OpenMP threads. Setting the environment variable here is only a fallback, since numpy is already imported
     # and most libraries read it at load time. The real limit is applied inside each worker by threadpoolctl (see _init_worker).
@@ -936,13 +943,6 @@ def run_emcee(likelihood_manager, args, kwargs, sampler_kwargs, reference_parame
     samples = sampler.get_chain(discard=burnin, flat=True, thin=thin)
     ln_posterior = sampler.get_log_prob(discard=burnin, flat=True, thin=thin)
 
-    if SAMPLER['produce_diagnostics']:
-        try:
-            from tdinf.utils import sampler_diagnostics
-            args.output_h5 = backend_path        # the diagnostics read the backend through this name
-            sampler_diagnostics.report_from_args(args, kwargs=kwargs, max_steps=20000)
-        except Exception as e:
-            print(f"WARNING: diagnostics skipped: {e}")
     print(f"emcee finished: {len(samples)} samples")
     return samples, ln_posterior
 
@@ -985,12 +985,8 @@ def _eryn_prior_class():
     """
     if 'TdinfPrior' in globals():
         return globals()['TdinfPrior']
-    try:
-        from eryn.prior import ProbDistContainer as base
-    except ImportError:
-        base = object
 
-    class TdinfPrior():
+    class TdinfPrior:
         def __init__(self, likelihood_manager):
             self._lm = likelihood_manager
             for name, value in (('ndim', likelihood_manager.num_parameters), ('use_cupy', False), ('return_gpu', False), ('xp', np), ('priors_in', {}), ('priors', [])):
@@ -1029,6 +1025,14 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
     if not hasattr(np, 'in1d'):
         np.in1d = lambda ar1, ar2, assume_unique=False, invert=False, **kwargs: np.isin(np.ravel(ar1), ar2, assume_unique=assume_unique, invert=invert, **kwargs)
     global _LM, _VERBOSE
+
+    # Eryn cannot resume a run with more than one parameter per branch as it is: on an existing file EnsembleSampler tests `key_order != backend.key_order`, where the first is the list
+    # [0, 1, ..., ndim-1] built from the priors and the second the numpy array read from the file; comparing the two raises "The truth value of an array ... is ambiguous". The
+    # backend below reads the key order back as the list.
+    class HDFBackend(HDFBackend):
+        @property
+        def key_order(self):
+            return {name: [int(i) for i in np.atleast_1d(value)] for name, value in super().key_order.items()}
 
     # where Eryn saves its output while the sampler runs
     backend_path = args.output if args.output.endswith('.h5') else os.path.splitext(args.output)[0] + '.h5'
@@ -1083,7 +1087,11 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
         tau_multiple=100,                # (100) converged when tau x tau_multiple < the number of steps, for every parameter
         tau_tolerance=0.01,              # (0.01) and the relative change of tau since the last check is below this
         chunksize=1,                     # (1) walkers handed to a worker at a time; 1 balances the load best, 2-4 cuts the dispatch cost when waveform runtimes are similar
-    )
+        burn_in_percent=None,            # (None) PER CENT (0 to below 100) of the steps of the cold chain to drop as burn-in. None: sampler_utils.eryn_burn_in_and_thin finds it, as the larger of 5 x the largest autocorrelation time and the start of the ln p plateau
+        max_samples=10000,               # (10000) most samples (walkers x steps) kept AFTER the burn-in, from a regular stride in steps counted back from the last step; None keeps every row that the thinning (0.5 x the largest autocorrelation time) leaves
+        initialize_from_prior=False,     # (False) True: draw the walkers from the prior (log_prior.sample_prior) instead of starting them at the reference point or posterior
+     )
+    
     SAMPLE_ARGUMENTS = ('thin_by', 'store', 'progress', 'tune', 'skip_initial_state_check')      # the keys of SAMPLER that sample() takes, besides iterations
 
     for key, value in sampler_kwargs.items():
@@ -1092,8 +1100,22 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
         elif key in SAMPLER:
             SAMPLER[key] = value
         else:
-            raise ValueError(f"unknown eryn setting {key!r}; valid settings are {sorted(CONSTRUCTOR) + sorted(SAMPLER)}")
-    
+            print(f'{key} not being used.')
+
+    # the two settings that choose the samples are checked now, not after a run of many hours
+    if SAMPLER['burn_in_percent'] is not None:
+        try:
+            percent = float(SAMPLER['burn_in_percent'])
+        except Exception as e:
+            print(f'Unable to accept the provided burn-in percent, due to error {e}. Following the plateau method to compute burn-in.')
+            percent = SAMPLER['burn_in_percent'] = None
+        if not 0 <= percent < 100:
+            print(f'burn-in should be between 0% and 100%. Following the plateau method to compute burn-in.')
+            percent = SAMPLER['burn_in_percent'] = None
+        if 0 < percent < 1:
+            percent = SAMPLER['burn_in_percent']* 100
+            print(f"NOTE: burn-in is too small. The burn-in is now {percent}")
+
     # the number of temperatures is needed before the sampler exists, for the shape of the starting state
     tempering = CONSTRUCTOR['tempering_kwargs']
     if tempering.get('betas') is not None:
@@ -1126,12 +1148,21 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
             if steps_done < 1:
                 raise AttributeError('no steps in the backend')
             resumed = True
-        except (AttributeError, KeyError, OSError, ValueError):
-            # This happens when the file has been made but the job crashed before writing any points to it.
-            # So we overwrite it
-            print('WARNING! Backend was empty, resetting backend')
-            os.remove(backend_path)
-    # a fresh run replaces the old backend, as backend.reset did for emcee
+        except (AttributeError, KeyError, OSError, ValueError) as error:
+            # The file is replaced only when it CERTAINLY holds no steps (made, but the job stopped before writing any). A backend that holds steps and cannot be read (an HDF5 lock held
+            # by another process, a file copied or killed while it was being written, an unreadable attribute) is never deleted: this used to delete it and start again.
+            stored = sampler_utils.eryn_steps_in_backend_file(backend_path)
+            if stored == 0:
+                print(f"WARNING! the backend {backend_path} holds no steps ({type(error).__name__}: {error}): replacing it")
+                os.remove(backend_path)
+            else:
+                raise RuntimeError(
+                    f"cannot resume from {backend_path}: Eryn could not read its last step ({type(error).__name__}: {error}). The file holds "
+                    f"{'an unknown number of' if stored is None else format(stored, ',')} steps and was NOT deleted. If the error is about locking, another process has the file open "
+                    "(or a lock is left on a network disk): stop it, or set HDF5_USE_FILE_LOCKING=FALSE. If it is 'address of object past end of allocation' or an unreadable attribute, "
+                    "the file was copied or killed while it was being written: `python shrink_eryn_h5.py <file> --inspect` lists what cannot be read, and the run can be continued from its "
+                    "last steps by writing them with `shrink_eryn_h5.py <file> --dat posterior.dat --command-file command_line.sh --skip-snrs` and starting a new run with "
+                    "--initial-walkers posterior.dat --initial-walker-type posterior.") from error
     elif os.path.isfile(backend_path):
         os.remove(backend_path)
     if resumed:
@@ -1150,7 +1181,7 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
                         CONSTRUCTOR['tempering_kwargs'] = dict(tempering, ntemps=ntemps)
     else:
         backend = HDFBackend(backend_path)
-        p0 = get_initial_walkers(likelihood_manager, args, ntemps * nwalkers, ndim, reference_parameters, ref_pe_samples)
+        p0 = get_initial_walkers(likelihood_manager, args, ntemps * nwalkers, ndim, reference_parameters, ref_pe_samples, from_prior=bool(SAMPLER['initialize_from_prior']))
         coords = np.asarray(getattr(p0, 'coords', p0), dtype=float).reshape(ntemps, nwalkers, 1, ndim)
         state = State(coords={ERYN_BRANCH: coords}, inds={ERYN_BRANCH: np.ones((ntemps, nwalkers, 1), dtype=bool)})
     CONSTRUCTOR['backend'] = backend     # the one object, so that the sampler and the lines below read and write the same backend
@@ -1245,8 +1276,8 @@ def run_eryn(likelihood_manager, args, kwargs, sampler_kwargs, reference_paramet
     cold = cold_new[:n_new] if cold_old.shape[0] == 0 else np.concatenate([cold_old, cold_new[:n_new]])
     ln_posterior_cold = np.concatenate([ln_like_old + ln_prior_old, ln_like_new[:n_new] + ln_prior_new[:n_new]])
     print(cold.shape)
-    burnin, thin = sampler_utils.eryn_burn_in_and_thin(cold)
-    keep = slice(burnin + thin - 1, None, thin)
+    burnin, thin = sampler_utils.eryn_burn_in_and_thin(cold, ln_posterior_cold, burn_in_percent=SAMPLER['burn_in_percent'])
+    keep = sampler_utils.eryn_sample_steps(steps, nwalkers, burnin, thin, SAMPLER['max_samples'])
     samples = cold[keep].reshape(-1, ndim)
     ln_posterior = ln_posterior_cold[keep].reshape(-1)
     if len(samples) == 0:
@@ -1296,6 +1327,14 @@ def main():
     samples, ln_posterior = SAMPLERS[args.sampler](
         likelihood_manager, args, kwargs, sampler_kwargs, reference_parameters, ref_pe_samples)
     print('samples shape:', np.shape(samples))
+    
+    # the HTML sampler diagnostics
+    if args.produce_diagnostics:
+        try:
+            from tdinf.utils import sampler_diagnostics
+            sampler_diagnostics.run(args.sampler, args, kwargs=kwargs, sampler_kwargs=sampler_kwargs, samples=samples, ln_posterior=ln_posterior)
+        except Exception as error:
+            print(f"WARNING: the sampler diagnostics were skipped: {type(error).__name__}: {error}")
 
     # post-processing and saving, the same for every sampler
     save_posterior(samples, ln_posterior, likelihood_manager, args.output, **kwargs)
